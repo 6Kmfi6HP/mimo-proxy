@@ -417,11 +417,18 @@ type anthropicMsgReq struct {
 	TopP          *float64       `json:"top_p,omitempty"`
 	StopSequences []string       `json:"stop_sequences,omitempty"`
 	Stream        bool           `json:"stream,omitempty"`
+	Tools         []anthropicTool `json:"tools,omitempty"`
 }
 
 type anthropicMsg struct {
 	Role    string      `json:"role"`
 	Content interface{} `json:"content"`
+}
+
+type anthropicTool struct {
+	Name        string      `json:"name"`
+	Description string      `json:"description,omitempty"`
+	InputSchema interface{} `json:"input_schema"`
 }
 
 // extractText handles Anthropic's polymorphic content field (string or []contentBlock).
@@ -453,6 +460,8 @@ func mapFinishReason(r string) string {
 		return "end_turn"
 	case "length":
 		return "max_tokens"
+	case "tool_calls":
+		return "tool_use"
 	}
 	return r
 }
@@ -475,6 +484,20 @@ func anthropicToOpenAI(req anthropicMsgReq) map[string]interface{} {
 	if len(req.StopSequences) > 0 {
 		oa["stop"] = req.StopSequences
 	}
+	if len(req.Tools) > 0 {
+		tools := make([]interface{}, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			tools = append(tools, map[string]interface{}{
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":        t.Name,
+					"description": t.Description,
+					"parameters":  t.InputSchema,
+				},
+			})
+		}
+		oa["tools"] = tools
+	}
 
 	messages := oa["messages"].([]interface{})
 
@@ -487,13 +510,120 @@ func anthropicToOpenAI(req anthropicMsgReq) map[string]interface{} {
 	}
 
 	for _, m := range req.Messages {
+		content := m.Content
+
+		// Anthropic assistant messages may contain tool_use blocks.
+		if m.Role == "assistant" {
+			if blocks, ok := content.([]interface{}); ok {
+				var textParts []string
+				var toolCalls []interface{}
+				for _, block := range blocks {
+					b, ok := block.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					switch b["type"] {
+					case "text":
+						if txt, _ := b["text"].(string); txt != "" {
+							textParts = append(textParts, txt)
+						}
+					case "tool_use":
+						tc := map[string]interface{}{
+							"id":   b["id"],
+							"type": "function",
+							"function": map[string]interface{}{
+								"name":      b["name"],
+								"arguments": mustJSON(b["input"]),
+							},
+						}
+						toolCalls = append(toolCalls, tc)
+					}
+				}
+				if len(toolCalls) > 0 {
+					msg := map[string]interface{}{
+						"role":       "assistant",
+						"tool_calls": toolCalls,
+					}
+					if len(textParts) > 0 {
+						msg["content"] = strings.Join(textParts, "")
+					}
+					messages = append(messages, msg)
+					continue
+				}
+			}
+		}
+
+		// Anthropic user messages may contain tool_result blocks.
+		if m.Role == "user" {
+			if blocks, ok := content.([]interface{}); ok {
+				var textParts []string
+				var toolResults []interface{}
+				for _, block := range blocks {
+					b, ok := block.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					switch b["type"] {
+					case "text":
+						if txt, _ := b["text"].(string); txt != "" {
+							textParts = append(textParts, txt)
+						}
+					case "tool_use": // assistant block forwarded in user context
+						tc := map[string]interface{}{
+							"id":   b["id"],
+							"type": "function",
+							"function": map[string]interface{}{
+								"name":      b["name"],
+								"arguments": mustJSON(b["input"]),
+							},
+						}
+						toolResults = append(toolResults, tc)
+					case "tool_result":
+						resultContent := ""
+						if c, ok := b["content"].(string); ok {
+							resultContent = c
+						} else if blocks2, ok := b["content"].([]interface{}); ok {
+							var parts []string
+							for _, b2 := range blocks2 {
+								if m2, ok := b2.(map[string]interface{}); ok && m2["type"] == "text" {
+									parts = append(parts, m2["text"].(string))
+								}
+							}
+							resultContent = strings.Join(parts, "")
+						}
+						toolResults = append(toolResults, map[string]interface{}{
+							"role":       "tool",
+							"tool_call_id": b["tool_use_id"],
+							"content":    resultContent,
+						})
+					}
+				}
+				// Emit text parts as a regular user message, then tool results.
+				if len(textParts) > 0 {
+					messages = append(messages, map[string]interface{}{
+						"role":    "user",
+						"content": strings.Join(textParts, ""),
+					})
+				}
+				for _, tr := range toolResults {
+					messages = append(messages, tr)
+				}
+				continue
+			}
+		}
+
 		messages = append(messages, map[string]interface{}{
 			"role":    m.Role,
-			"content": extractText(m.Content),
+			"content": extractText(content),
 		})
 	}
 	oa["messages"] = messages
 	return oa
+}
+
+func mustJSON(v interface{}) string {
+	b, _ := json.Marshal(v)
+	return string(b)
 }
 
 func openaiToAnthropic(openaiBody []byte, model string) map[string]interface{} {
@@ -501,8 +631,16 @@ func openaiToAnthropic(openaiBody []byte, model string) map[string]interface{} {
 		ID      string `json:"id"`
 		Choices []struct {
 			Message struct {
-				Role    string `json:"role"`
-				Content string `json:"content"`
+				Role      string `json:"role"`
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
 			} `json:"message"`
 			FinishReason *string `json:"finish_reason"`
 		} `json:"choices"`
@@ -536,20 +674,39 @@ func openaiToAnthropic(openaiBody []byte, model string) map[string]interface{} {
 		stopReason = mapFinishReason(*oa.Choices[0].FinishReason)
 	}
 
-	content := ""
 	role := "assistant"
+	var contentBlocks []interface{}
 	if len(oa.Choices) > 0 {
-		content = oa.Choices[0].Message.Content
-		if oa.Choices[0].Message.Role != "" {
-			role = oa.Choices[0].Message.Role
+		msg := oa.Choices[0].Message
+		if msg.Role != "" {
+			role = msg.Role
 		}
+		if msg.Content != "" {
+			contentBlocks = append(contentBlocks, map[string]interface{}{
+				"type": "text",
+				"text": msg.Content,
+			})
+		}
+		for _, tc := range msg.ToolCalls {
+			var input map[string]interface{}
+			json.Unmarshal([]byte(tc.Function.Arguments), &input)
+			contentBlocks = append(contentBlocks, map[string]interface{}{
+				"type":  "tool_use",
+				"id":    tc.ID,
+				"name":  tc.Function.Name,
+				"input": input,
+			})
+		}
+	}
+	if len(contentBlocks) == 0 {
+		contentBlocks = []interface{}{map[string]interface{}{"type": "text", "text": ""}}
 	}
 
 	resp := map[string]interface{}{
 		"id":          "msg_" + randomID(),
 		"type":        "message",
 		"role":        role,
-		"content":     []interface{}{map[string]interface{}{"type": "text", "text": content}},
+		"content":     contentBlocks,
 		"model":       model,
 		"stop_reason": stopReason,
 	}
@@ -576,8 +733,16 @@ func emitSSE(w io.Writer, flusher http.Flusher, event string, data interface{}) 
 
 func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flusher http.Flusher, model string, inputTokens int) error {
 	msgID := "msg_" + randomID()
-	var started, blockStarted, stopped bool
+	var started, blockStarted, textClosed, stopped bool
 	var outputTokens int
+	// Track tool call blocks: OpenAI tool_call index → Anthropic block index.
+	type toolBlock struct {
+		blockIndex int
+		name       string
+		started    bool
+	}
+	toolBlocks := map[int]*toolBlock{}
+	nextBlockIndex := 1 // 0 is the text block
 
 	emitMessageStart := func() error {
 		return emitSSE(w, flusher, "message_start", map[string]interface{}{
@@ -604,11 +769,29 @@ func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flush
 			"content_block": map[string]interface{}{"type": "text", "text": ""},
 		})
 	}
+	closeTextBlock := func() error {
+		if blockStarted && !textClosed {
+			textClosed = true
+			return emitSSE(w, flusher, "content_block_stop", map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": 0,
+			})
+		}
+		return nil
+	}
+	closeLastBlock := func() error {
+		if len(toolBlocks) > 0 {
+			// Close the last tool block.
+			last := nextBlockIndex - 1
+			return emitSSE(w, flusher, "content_block_stop", map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": last,
+			})
+		}
+		return closeTextBlock()
+	}
 	emitStopEvents := func(stopReason string) error {
-		if err := emitSSE(w, flusher, "content_block_stop", map[string]interface{}{
-			"type":  "content_block_stop",
-			"index": 0,
-		}); err != nil {
+		if err := closeLastBlock(); err != nil {
 			return err
 		}
 		if err := emitSSE(w, flusher, "message_delta", map[string]interface{}{
@@ -645,13 +828,11 @@ func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flush
 		data := strings.TrimPrefix(line, "data: ")
 		if data == "[DONE]" {
 			if !started {
-				started = true
 				if err := emitMessageStart(); err != nil {
 					return err
 				}
 			}
-			if !blockStarted {
-				blockStarted = true
+			if !blockStarted && len(toolBlocks) == 0 {
 				if err := emitContentBlockStart(); err != nil {
 					return err
 				}
@@ -667,8 +848,17 @@ func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flush
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Role    string `json:"role"`
-					Content string `json:"content"`
+					Role      string `json:"role"`
+					Content   string `json:"content"`
+					ToolCalls []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Type     string `json:"type"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
 				} `json:"delta"`
 				FinishReason *string `json:"finish_reason"`
 			} `json:"choices"`
@@ -692,14 +882,14 @@ func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flush
 			}
 		}
 
-		if !blockStarted {
-			blockStarted = true
-			if err := emitContentBlockStart(); err != nil {
-				return err
-			}
-		}
-
+		// Text content.
 		if choice.Delta.Content != "" {
+			if !blockStarted {
+				blockStarted = true
+				if err := emitContentBlockStart(); err != nil {
+					return err
+				}
+			}
 			if err := emitSSE(w, flusher, "content_block_delta", map[string]interface{}{
 				"type":  "content_block_delta",
 				"index": 0,
@@ -709,6 +899,45 @@ func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flush
 				},
 			}); err != nil {
 				return err
+			}
+		}
+
+		// Tool calls.
+		for _, tc := range choice.Delta.ToolCalls {
+			tb, exists := toolBlocks[tc.Index]
+			if !exists {
+				// New tool call — close text block first.
+				if err := closeTextBlock(); err != nil {
+					return err
+				}
+				tb = &toolBlock{blockIndex: nextBlockIndex, name: tc.Function.Name}
+				toolBlocks[tc.Index] = tb
+				nextBlockIndex++
+				if err := emitSSE(w, flusher, "content_block_start", map[string]interface{}{
+					"type":  "content_block_start",
+					"index": tb.blockIndex,
+					"content_block": map[string]interface{}{
+						"type":  "tool_use",
+						"id":    tc.ID,
+						"name":  tb.name,
+						"input": map[string]interface{}{},
+					},
+				}); err != nil {
+					return err
+				}
+				tb.started = true
+			}
+			if tc.Function.Arguments != "" {
+				if err := emitSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": tb.blockIndex,
+					"delta": map[string]interface{}{
+						"type":         "input_json_delta",
+						"partial_json": tc.Function.Arguments,
+					},
+				}); err != nil {
+					return err
+				}
 			}
 		}
 
