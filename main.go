@@ -29,9 +29,8 @@ const (
 	defaultBaseURL      = "https://api.xiaomimimo.com"
 	jwtRefreshBuffer    = 5 * time.Minute
 	jwtDefaultTTL       = 50 * time.Minute
-	maxBodyBytes        = 32 * 1024 * 1024
-	maxAuthRetries      = 1
-	requestTimeout      = 5 * time.Minute
+	maxBodyBytes   = 32 * 1024 * 1024
+	requestTimeout = 5 * time.Minute
 	shutdownGracePeriod = 25 * time.Second
 )
 
@@ -42,15 +41,17 @@ var (
 	httpClient   = &http.Client{Timeout: requestTimeout + 30*time.Second}
 )
 
-// --- fingerprint ---
+// --- fingerprint pool ---
+
+const numFingerprints = 3
 
 var (
-	fingerprintOnce sync.Once
-	fingerprintVal  string
+	fpOnce sync.Once
+	fpStrs []string // generated fingerprints
 )
 
-func getFingerprint() string {
-	fingerprintOnce.Do(func() {
+func initFingerprints() {
+	fpOnce.Do(func() {
 		hostname, _ := os.Hostname()
 		if hostname == "" {
 			hostname = "unknown-host"
@@ -61,12 +62,13 @@ func getFingerprint() string {
 		if u, err := osUserInfo(); err == nil {
 			username = u
 		}
-		seed := fmt.Sprintf("%s|%s|%s|%s|%s",
-			hostname, platform, arch, username, randomUUID())
-		h := sha256.Sum256([]byte(seed))
-		fingerprintVal = fmt.Sprintf("%x", h)
+		base := fmt.Sprintf("%s|%s|%s|%s", hostname, platform, arch, username)
+		fpStrs = make([]string, numFingerprints)
+		for i := 0; i < numFingerprints; i++ {
+			h := sha256.Sum256([]byte(fmt.Sprintf("%s|%s", base, randomUUID())))
+			fpStrs[i] = fmt.Sprintf("%x", h)
+		}
 	})
-	return fingerprintVal
 }
 
 func osUserInfo() (string, error) {
@@ -102,10 +104,14 @@ type jwtEntry struct {
 	exp int64 // unix millis
 }
 
+type jwtSlot struct {
+	fp    string
+	entry *jwtEntry
+}
+
 var (
-	jwtMu     sync.Mutex
-	jwtCached *jwtEntry
-	jwtFlight = &sync.Mutex{} // inflight flag + lock
+	jwtMu    sync.Mutex
+	jwtSlots []*jwtSlot
 )
 
 func parseExp(jwt string) int64 {
@@ -129,8 +135,8 @@ func parseExp(jwt string) int64 {
 	return time.Now().UnixMilli() + jwtDefaultTTL.Milliseconds()
 }
 
-func bootstrap(ctx context.Context) (*jwtEntry, error) {
-	payload := map[string]string{"client": getFingerprint()}
+func bootstrap(ctx context.Context, fp string) (*jwtEntry, error) {
+	payload := map[string]string{"client": fp}
 	body, _ := json.Marshal(payload)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", bootstrapURL, bytes.NewReader(body))
@@ -162,52 +168,77 @@ func bootstrap(ctx context.Context) (*jwtEntry, error) {
 	return &jwtEntry{jwt: data.Jwt, exp: parseExp(data.Jwt)}, nil
 }
 
-// getJwt returns a valid JWT, refreshing if needed.
-// It implements inflight-deduplication: only one goroutine refreshes at a time.
-func getJwt(ctx context.Context) (string, error) {
-	const maxJwtRetries = 3
-	for attempt := 0; attempt < maxJwtRetries; attempt++ {
-		jwtMu.Lock()
-		if jwtCached != nil && jwtCached.exp-time.Now().UnixMilli() > jwtRefreshBuffer.Milliseconds() {
-			j := jwtCached.jwt
-			jwtMu.Unlock()
-			return j, nil
-		}
-
-		// Try to acquire the inflight lock.
-		if !jwtFlight.TryLock() {
-			// Another goroutine is refreshing; wait for it to finish.
-			jwtMu.Unlock()
-			jwtFlight.Lock()
-			jwtFlight.Unlock()
-
-			// Re-check cache — the refresh may have succeeded or failed.
-			jwtMu.Lock()
-			if jwtCached != nil {
-				j := jwtCached.jwt
-				jwtMu.Unlock()
-				return j, nil
-			}
-			jwtMu.Unlock()
-			// Cache still nil (refresh failed); loop to retry.
-			continue
-		}
-		jwtMu.Unlock()
-
-		entry, err := bootstrap(ctx)
-		jwtMu.Lock()
-		if err == nil {
-			jwtCached = entry
-		}
-		jwtMu.Unlock()
-		jwtFlight.Unlock()
-
-		if err != nil {
-			return "", err
-		}
-		return entry.jwt, nil
+// initJwtSlots initializes the JWT pool from fingerprints.
+func initJwtSlots() {
+	initFingerprints()
+	jwtMu.Lock()
+	defer jwtMu.Unlock()
+	if len(jwtSlots) > 0 {
+		return
 	}
-	return "", fmt.Errorf("jwt refresh failed after %d attempts", maxJwtRetries)
+	for _, fp := range fpStrs {
+		jwtSlots = append(jwtSlots, &jwtSlot{fp: fp})
+	}
+}
+
+var jwtRoundRobin int
+
+// getJwt picks the next slot round-robin. Each request gets a different JWT,
+// spreading load across fingerprints to avoid rate limits.
+func getJwt(ctx context.Context) (string, error) {
+	initJwtSlots()
+
+	jwtMu.Lock()
+	defer jwtMu.Unlock()
+	for attempts := 0; attempts < len(jwtSlots); attempts++ {
+		jwtRoundRobin = (jwtRoundRobin + 1) % len(jwtSlots)
+		s := jwtSlots[jwtRoundRobin]
+		if s.entry != nil {
+			return s.entry.jwt, nil
+		}
+	}
+	return "", fmt.Errorf("no JWT available")
+}
+
+// startJwtRefresher proactively keeps all slots filled with fresh JWTs.
+// First fills all slots synchronously, then refreshes in background.
+func startJwtRefresher(ctx context.Context) {
+	// Initial fill — try once, then let the background loop handle failures.
+	fillCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	for _, s := range jwtSlots {
+		if entry, err := bootstrap(fillCtx, s.fp); err == nil {
+			jwtMu.Lock()
+			s.entry = entry
+			jwtMu.Unlock()
+		}
+	}
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				now := time.Now().UnixMilli()
+				for _, s := range jwtSlots {
+					jwtMu.Lock()
+					needsRefresh := s.entry == nil || s.entry.exp-now <= jwtRefreshBuffer.Milliseconds()
+					fp := s.fp
+					jwtMu.Unlock()
+					if needsRefresh {
+						if entry, err := bootstrap(ctx, fp); err == nil {
+							jwtMu.Lock()
+							s.entry = entry
+							jwtMu.Unlock()
+						}
+					}
+				}
+			}
+		}
+	}()
 }
 
 // --- upstream ---
@@ -236,25 +267,7 @@ func doUpstreamRequest(ctx context.Context, body []byte) (*http.Response, error)
 }
 
 func callUpstream(ctx context.Context, body []byte) (*http.Response, error) {
-	resp, err := doUpstreamRequest(ctx, body)
-	if err != nil {
-		return nil, err
-	}
-
-	retries := 0
-	for (resp.StatusCode == 401 || resp.StatusCode == 403) && retries < maxAuthRetries {
-		resp.Body.Close()
-		retries++
-		jwtMu.Lock()
-		jwtCached = nil
-		jwtMu.Unlock()
-
-		resp, err = doUpstreamRequest(ctx, body)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return resp, nil
+	return doUpstreamRequest(ctx, body)
 }
 
 // --- http helpers ---
@@ -1249,7 +1262,11 @@ func main() {
 	// Start server in background.
 	go func() {
 		log.Printf("mimo-proxy listening on http://0.0.0.0:%s", port)
-		log.Printf("fingerprint:  %s", getFingerprint())
+		initJwtSlots()
+		for i, fp := range fpStrs {
+			log.Printf("fingerprint %d: %s", i+1, fp)
+		}
+		startJwtRefresher(context.Background())
 		log.Printf("forwarding:   POST %s", chatURL)
 		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 			log.Fatalf("server error: %v", err)
