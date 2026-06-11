@@ -166,7 +166,7 @@ func bootstrap(ctx context.Context) (*jwtEntry, error) {
 }
 
 // getJwt returns a valid JWT, refreshing if needed.
-// It implements the same inflight-deduplication pattern as the JS version.
+// It implements inflight-deduplication: only one goroutine refreshes at a time.
 func getJwt(ctx context.Context) (string, error) {
 	jwtMu.Lock()
 	if jwtCached != nil && jwtCached.exp-time.Now().UnixMilli() > jwtRefreshBuffer.Milliseconds() {
@@ -177,14 +177,21 @@ func getJwt(ctx context.Context) (string, error) {
 
 	// Try to acquire the inflight lock.
 	if !jwtFlight.TryLock() {
-		// Another goroutine is already refreshing; wait for it.
+		// Another goroutine is refreshing; wait for it to finish.
 		jwtMu.Unlock()
-		jwtFlight.Lock() // block until refresh completes
-		jwtMu.Lock()
-		j := jwtCached.jwt
-		jwtMu.Unlock()
+		jwtFlight.Lock()
 		jwtFlight.Unlock()
-		return j, nil
+
+		// Re-check cache — the refresh may have succeeded or failed.
+		jwtMu.Lock()
+		if jwtCached != nil {
+			j := jwtCached.jwt
+			jwtMu.Unlock()
+			return j, nil
+		}
+		jwtMu.Unlock()
+		// Cache still nil (refresh failed); fall through to try ourselves.
+		return getJwt(ctx)
 	}
 	// We hold both jwtMu and jwtFlight.
 	jwtMu.Unlock()
@@ -358,8 +365,9 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(resp.StatusCode)
 
-	// Stream the body.
+	// Stream the body. Clear write deadline for long-lived SSE connections.
 	if flusher, ok := w.(http.Flusher); ok {
+		http.NewResponseController(w).SetWriteDeadline(time.Time{})
 		buf := make([]byte, 4096)
 		for {
 			n, readErr := resp.Body.Read(buf)
@@ -532,7 +540,7 @@ func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flush
 	var outputTokens int
 
 	scanner := bufio.NewScanner(upstream)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
 	for scanner.Scan() {
 		select {
@@ -729,6 +737,7 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
+		http.NewResponseController(w).SetWriteDeadline(time.Time{})
 		w.WriteHeader(resp.StatusCode)
 
 		if err := translateStream(ctx, resp.Body, w, flusher, req.Model, inputTokens); err != nil {
