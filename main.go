@@ -409,15 +409,27 @@ func extractUpstreamError(body []byte) string {
 }
 
 type anthropicMsgReq struct {
-	Model         string         `json:"model"`
-	Messages      []anthropicMsg `json:"messages"`
-	System        interface{}    `json:"system"`
-	MaxTokens     int            `json:"max_tokens"`
-	Temperature   *float64       `json:"temperature,omitempty"`
-	TopP          *float64       `json:"top_p,omitempty"`
-	StopSequences []string       `json:"stop_sequences,omitempty"`
-	Stream        bool           `json:"stream,omitempty"`
+	Model         string          `json:"model"`
+	Messages      []anthropicMsg  `json:"messages"`
+	System        interface{}     `json:"system"`
+	MaxTokens     int             `json:"max_tokens"`
+	Temperature   *float64        `json:"temperature,omitempty"`
+	TopP          *float64        `json:"top_p,omitempty"`
+	StopSequences []string        `json:"stop_sequences,omitempty"`
+	Stream        bool            `json:"stream,omitempty"`
 	Tools         []anthropicTool `json:"tools,omitempty"`
+	ToolChoice    interface{}     `json:"tool_choice,omitempty"`
+	Thinking      *anthropicThinking `json:"thinking,omitempty"`
+	Metadata      *anthropicMetadata `json:"metadata,omitempty"`
+}
+
+type anthropicThinking struct {
+	Type        string `json:"type"`        // "enabled" or "disabled"
+	BudgetTokens int   `json:"budget_tokens,omitempty"`
+}
+
+type anthropicMetadata struct {
+	UserID string `json:"user_id,omitempty"`
 }
 
 type anthropicMsg struct {
@@ -472,6 +484,9 @@ func anthropicToOpenAI(req anthropicMsgReq) map[string]interface{} {
 		"messages": []interface{}{},
 		"stream":   req.Stream,
 	}
+	if req.Stream {
+		oa["stream_options"] = map[string]interface{}{"include_usage": true}
+	}
 	if req.MaxTokens > 0 {
 		oa["max_tokens"] = req.MaxTokens
 	}
@@ -498,6 +513,15 @@ func anthropicToOpenAI(req anthropicMsgReq) map[string]interface{} {
 		}
 		oa["tools"] = tools
 	}
+	if req.ToolChoice != nil {
+		oa["tool_choice"] = convertToolChoice(req.ToolChoice)
+	}
+	if req.Thinking != nil && req.Thinking.Type == "enabled" && req.Thinking.BudgetTokens > 0 {
+		oa["thinking_budget"] = req.Thinking.BudgetTokens
+	}
+	if req.Metadata != nil && req.Metadata.UserID != "" {
+		oa["user"] = req.Metadata.UserID
+	}
 
 	messages := oa["messages"].([]interface{})
 
@@ -516,6 +540,7 @@ func anthropicToOpenAI(req anthropicMsgReq) map[string]interface{} {
 		if m.Role == "assistant" {
 			if blocks, ok := content.([]interface{}); ok {
 				var textParts []string
+				var reasoningParts []string
 				var toolCalls []interface{}
 				for _, block := range blocks {
 					b, ok := block.(map[string]interface{})
@@ -526,6 +551,10 @@ func anthropicToOpenAI(req anthropicMsgReq) map[string]interface{} {
 					case "text":
 						if txt, _ := b["text"].(string); txt != "" {
 							textParts = append(textParts, txt)
+						}
+					case "thinking":
+						if txt, _ := b["thinking"].(string); txt != "" {
+							reasoningParts = append(reasoningParts, txt)
 						}
 					case "tool_use":
 						tc := map[string]interface{}{
@@ -539,13 +568,18 @@ func anthropicToOpenAI(req anthropicMsgReq) map[string]interface{} {
 						toolCalls = append(toolCalls, tc)
 					}
 				}
-				if len(toolCalls) > 0 {
+				if len(toolCalls) > 0 || len(reasoningParts) > 0 {
 					msg := map[string]interface{}{
-						"role":       "assistant",
-						"tool_calls": toolCalls,
+						"role": "assistant",
 					}
 					if len(textParts) > 0 {
 						msg["content"] = strings.Join(textParts, "")
+					}
+					if len(reasoningParts) > 0 {
+						msg["reasoning_content"] = strings.Join(reasoningParts, "")
+					}
+					if len(toolCalls) > 0 {
+						msg["tool_calls"] = toolCalls
 					}
 					messages = append(messages, msg)
 					continue
@@ -568,16 +602,6 @@ func anthropicToOpenAI(req anthropicMsgReq) map[string]interface{} {
 						if txt, _ := b["text"].(string); txt != "" {
 							textParts = append(textParts, txt)
 						}
-					case "tool_use": // assistant block forwarded in user context
-						tc := map[string]interface{}{
-							"id":   b["id"],
-							"type": "function",
-							"function": map[string]interface{}{
-								"name":      b["name"],
-								"arguments": mustJSON(b["input"]),
-							},
-						}
-						toolResults = append(toolResults, tc)
 					case "tool_result":
 						resultContent := ""
 						if c, ok := b["content"].(string); ok {
@@ -626,14 +650,42 @@ func mustJSON(v interface{}) string {
 	return string(b)
 }
 
+// convertToolChoice maps Anthropic tool_choice to OpenAI format.
+func convertToolChoice(v interface{}) interface{} {
+	tc, ok := v.(map[string]interface{})
+	if !ok {
+		return v
+	}
+	switch tc["type"] {
+	case "auto":
+		return "auto"
+	case "any":
+		return "required"
+	case "none":
+		return "none"
+	case "tool":
+		if name, _ := tc["name"].(string); name != "" {
+			return map[string]interface{}{
+				"type": "function",
+				"function": map[string]interface{}{
+					"name": name,
+				},
+			}
+		}
+		return "auto"
+	}
+	return "auto"
+}
+
 func openaiToAnthropic(openaiBody []byte, model string) map[string]interface{} {
 	var oa struct {
 		ID      string `json:"id"`
 		Choices []struct {
 			Message struct {
-				Role      string `json:"role"`
-				Content   string `json:"content"`
-				ToolCalls []struct {
+				Role             string `json:"role"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				ToolCalls        []struct {
 					ID       string `json:"id"`
 					Type     string `json:"type"`
 					Function struct {
@@ -680,6 +732,12 @@ func openaiToAnthropic(openaiBody []byte, model string) map[string]interface{} {
 		msg := oa.Choices[0].Message
 		if msg.Role != "" {
 			role = msg.Role
+		}
+		if msg.ReasoningContent != "" {
+			contentBlocks = append(contentBlocks, map[string]interface{}{
+				"type":     "thinking",
+				"thinking": msg.ReasoningContent,
+			})
 		}
 		if msg.Content != "" {
 			contentBlocks = append(contentBlocks, map[string]interface{}{
@@ -733,16 +791,25 @@ func emitSSE(w io.Writer, flusher http.Flusher, event string, data interface{}) 
 
 func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flusher http.Flusher, model string, inputTokens int) error {
 	msgID := "msg_" + randomID()
-	var started, blockStarted, textClosed, stopped bool
+	var started, stopped bool
 	var outputTokens int
-	// Track tool call blocks: OpenAI tool_call index → Anthropic block index.
-	type toolBlock struct {
-		blockIndex int
-		name       string
-		started    bool
+
+	// Block index tracking: sequential, auto-assigned.
+	type blockState struct {
+		index   int
+		blockType string // "thinking", "text", "tool_use"
+		closed  bool
+		name    string // for tool_use
 	}
-	toolBlocks := map[int]*toolBlock{}
-	nextBlockIndex := 1 // 0 is the text block
+	var blocks []*blockState
+	// Map from OpenAI tool_call index → blockState.
+	toolBlocks := map[int]*blockState{}
+
+	allocBlock := func(bt string) *blockState {
+		bs := &blockState{index: len(blocks), blockType: bt}
+		blocks = append(blocks, bs)
+		return bs
+	}
 
 	emitMessageStart := func() error {
 		return emitSSE(w, flusher, "message_start", map[string]interface{}{
@@ -762,36 +829,26 @@ func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flush
 			},
 		})
 	}
-	emitContentBlockStart := func() error {
-		return emitSSE(w, flusher, "content_block_start", map[string]interface{}{
-			"type":          "content_block_start",
-			"index":         0,
-			"content_block": map[string]interface{}{"type": "text", "text": ""},
-		})
-	}
-	closeTextBlock := func() error {
-		if blockStarted && !textClosed {
-			textClosed = true
+	closeBlock := func(bs *blockState) error {
+		if !bs.closed {
+			bs.closed = true
 			return emitSSE(w, flusher, "content_block_stop", map[string]interface{}{
 				"type":  "content_block_stop",
-				"index": 0,
+				"index": bs.index,
 			})
 		}
 		return nil
 	}
-	closeLastBlock := func() error {
-		if len(toolBlocks) > 0 {
-			// Close the last tool block.
-			last := nextBlockIndex - 1
-			return emitSSE(w, flusher, "content_block_stop", map[string]interface{}{
-				"type":  "content_block_stop",
-				"index": last,
-			})
+	closeLastOpenBlock := func() error {
+		for i := len(blocks) - 1; i >= 0; i-- {
+			if !blocks[i].closed {
+				return closeBlock(blocks[i])
+			}
 		}
-		return closeTextBlock()
+		return nil
 	}
 	emitStopEvents := func(stopReason string) error {
-		if err := closeLastBlock(); err != nil {
+		if err := closeLastOpenBlock(); err != nil {
 			return err
 		}
 		if err := emitSSE(w, flusher, "message_delta", map[string]interface{}{
@@ -832,8 +889,14 @@ func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flush
 					return err
 				}
 			}
-			if !blockStarted && len(toolBlocks) == 0 {
-				if err := emitContentBlockStart(); err != nil {
+			if len(blocks) == 0 {
+				// No content at all — emit empty text block.
+				bs := allocBlock("text")
+				if err := emitSSE(w, flusher, "content_block_start", map[string]interface{}{
+					"type":          "content_block_start",
+					"index":         bs.index,
+					"content_block": map[string]interface{}{"type": "text", "text": ""},
+				}); err != nil {
 					return err
 				}
 			}
@@ -848,9 +911,10 @@ func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flush
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Role      string `json:"role"`
-					Content   string `json:"content"`
-					ToolCalls []struct {
+					Role             string `json:"role"`
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+					ToolCalls        []struct {
 						Index    int    `json:"index"`
 						ID       string `json:"id"`
 						Type     string `json:"type"`
@@ -882,17 +946,72 @@ func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flush
 			}
 		}
 
-		// Text content.
-		if choice.Delta.Content != "" {
-			if !blockStarted {
-				blockStarted = true
-				if err := emitContentBlockStart(); err != nil {
+		// Reasoning/thinking content.
+		if choice.Delta.ReasoningContent != "" {
+			// Find or create thinking block.
+			var thinkingBlock *blockState
+			for _, bs := range blocks {
+				if bs.blockType == "thinking" && !bs.closed {
+					thinkingBlock = bs
+					break
+				}
+			}
+			if thinkingBlock == nil {
+				thinkingBlock = allocBlock("thinking")
+				if err := emitSSE(w, flusher, "content_block_start", map[string]interface{}{
+					"type":  "content_block_start",
+					"index": thinkingBlock.index,
+					"content_block": map[string]interface{}{
+						"type":     "thinking",
+						"thinking": "",
+					},
+				}); err != nil {
 					return err
 				}
 			}
 			if err := emitSSE(w, flusher, "content_block_delta", map[string]interface{}{
 				"type":  "content_block_delta",
-				"index": 0,
+				"index": thinkingBlock.index,
+				"delta": map[string]interface{}{
+					"type":     "thinking_delta",
+					"thinking": choice.Delta.ReasoningContent,
+				},
+			}); err != nil {
+				return err
+			}
+		}
+
+		// Text content.
+		if choice.Delta.Content != "" {
+			// Close thinking block if still open.
+			for _, bs := range blocks {
+				if bs.blockType == "thinking" && !bs.closed {
+					if err := closeBlock(bs); err != nil {
+						return err
+					}
+				}
+			}
+			// Find or create text block.
+			var textBlock *blockState
+			for _, bs := range blocks {
+				if bs.blockType == "text" && !bs.closed {
+					textBlock = bs
+					break
+				}
+			}
+			if textBlock == nil {
+				textBlock = allocBlock("text")
+				if err := emitSSE(w, flusher, "content_block_start", map[string]interface{}{
+					"type":          "content_block_start",
+					"index":         textBlock.index,
+					"content_block": map[string]interface{}{"type": "text", "text": ""},
+				}); err != nil {
+					return err
+				}
+			}
+			if err := emitSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": textBlock.index,
 				"delta": map[string]interface{}{
 					"type": "text_delta",
 					"text": choice.Delta.Content,
@@ -906,16 +1025,20 @@ func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flush
 		for _, tc := range choice.Delta.ToolCalls {
 			tb, exists := toolBlocks[tc.Index]
 			if !exists {
-				// New tool call — close text block first.
-				if err := closeTextBlock(); err != nil {
-					return err
+				// Close thinking and text blocks if still open.
+				for _, bs := range blocks {
+					if (bs.blockType == "thinking" || bs.blockType == "text") && !bs.closed {
+						if err := closeBlock(bs); err != nil {
+							return err
+						}
+					}
 				}
-				tb = &toolBlock{blockIndex: nextBlockIndex, name: tc.Function.Name}
+				tb = allocBlock("tool_use")
+				tb.name = tc.Function.Name
 				toolBlocks[tc.Index] = tb
-				nextBlockIndex++
 				if err := emitSSE(w, flusher, "content_block_start", map[string]interface{}{
 					"type":  "content_block_start",
-					"index": tb.blockIndex,
+					"index": tb.index,
 					"content_block": map[string]interface{}{
 						"type":  "tool_use",
 						"id":    tc.ID,
@@ -925,12 +1048,11 @@ func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flush
 				}); err != nil {
 					return err
 				}
-				tb.started = true
 			}
 			if tc.Function.Arguments != "" {
 				if err := emitSSE(w, flusher, "content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
-					"index": tb.blockIndex,
+					"index": tb.index,
 					"delta": map[string]interface{}{
 						"type":         "input_json_delta",
 						"partial_json": tc.Function.Arguments,
