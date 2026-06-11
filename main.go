@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -38,6 +39,7 @@ var (
 	port         string
 	bootstrapURL string
 	chatURL      string
+	httpClient   = &http.Client{Timeout: requestTimeout + 30*time.Second}
 )
 
 // --- fingerprint ---
@@ -55,13 +57,12 @@ func getFingerprint() string {
 		}
 		platform := runtime.GOOS
 		arch := runtime.GOARCH
-		cpu := "unknown-cpu"
 		username := "unknown-user"
 		if u, err := osUserInfo(); err == nil {
 			username = u
 		}
-		seed := fmt.Sprintf("%s|%s|%s|%s|%s|%s",
-			hostname, platform, arch, cpu, username, randomUUID())
+		seed := fmt.Sprintf("%s|%s|%s|%s|%s",
+			hostname, platform, arch, username, randomUUID())
 		h := sha256.Sum256([]byte(seed))
 		fingerprintVal = fmt.Sprintf("%x", h)
 	})
@@ -104,12 +105,8 @@ type jwtEntry struct {
 var (
 	jwtMu     sync.Mutex
 	jwtCached *jwtEntry
-	jwtFlight *sync.Mutex // doubles as inflight flag + lock
+	jwtFlight = &sync.Mutex{} // inflight flag + lock
 )
-
-func init() {
-	jwtFlight = &sync.Mutex{}
-}
 
 func parseExp(jwt string) int64 {
 	parts := strings.Split(jwt, ".")
@@ -142,7 +139,7 @@ func bootstrap(ctx context.Context) (*jwtEntry, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -168,52 +165,55 @@ func bootstrap(ctx context.Context) (*jwtEntry, error) {
 // getJwt returns a valid JWT, refreshing if needed.
 // It implements inflight-deduplication: only one goroutine refreshes at a time.
 func getJwt(ctx context.Context) (string, error) {
-	jwtMu.Lock()
-	if jwtCached != nil && jwtCached.exp-time.Now().UnixMilli() > jwtRefreshBuffer.Milliseconds() {
-		j := jwtCached.jwt
-		jwtMu.Unlock()
-		return j, nil
-	}
-
-	// Try to acquire the inflight lock.
-	if !jwtFlight.TryLock() {
-		// Another goroutine is refreshing; wait for it to finish.
-		jwtMu.Unlock()
-		jwtFlight.Lock()
-		jwtFlight.Unlock()
-
-		// Re-check cache — the refresh may have succeeded or failed.
+	const maxJwtRetries = 3
+	for attempt := 0; attempt < maxJwtRetries; attempt++ {
 		jwtMu.Lock()
-		if jwtCached != nil {
+		if jwtCached != nil && jwtCached.exp-time.Now().UnixMilli() > jwtRefreshBuffer.Milliseconds() {
 			j := jwtCached.jwt
 			jwtMu.Unlock()
 			return j, nil
 		}
+
+		// Try to acquire the inflight lock.
+		if !jwtFlight.TryLock() {
+			// Another goroutine is refreshing; wait for it to finish.
+			jwtMu.Unlock()
+			jwtFlight.Lock()
+			jwtFlight.Unlock()
+
+			// Re-check cache — the refresh may have succeeded or failed.
+			jwtMu.Lock()
+			if jwtCached != nil {
+				j := jwtCached.jwt
+				jwtMu.Unlock()
+				return j, nil
+			}
+			jwtMu.Unlock()
+			// Cache still nil (refresh failed); loop to retry.
+			continue
+		}
 		jwtMu.Unlock()
-		// Cache still nil (refresh failed); fall through to try ourselves.
-		return getJwt(ctx)
-	}
-	// We hold both jwtMu and jwtFlight.
-	jwtMu.Unlock()
 
-	entry, err := bootstrap(ctx)
-	jwtMu.Lock()
-	if err == nil {
-		jwtCached = entry
-	}
-	jwtMu.Unlock()
-	jwtFlight.Unlock()
+		entry, err := bootstrap(ctx)
+		jwtMu.Lock()
+		if err == nil {
+			jwtCached = entry
+		}
+		jwtMu.Unlock()
+		jwtFlight.Unlock()
 
-	if err != nil {
-		return "", err
+		if err != nil {
+			return "", err
+		}
+		return entry.jwt, nil
 	}
-	return entry.jwt, nil
+	return "", fmt.Errorf("jwt refresh failed after %d attempts", maxJwtRetries)
 }
 
 // --- upstream ---
 
-func upstreamRequest(ctx context.Context, jwt, bodyStr string) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, "POST", chatURL, strings.NewReader(bodyStr))
+func upstreamRequest(ctx context.Context, jwt string, body []byte) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", chatURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -223,17 +223,20 @@ func upstreamRequest(ctx context.Context, jwt, bodyStr string) (*http.Request, e
 	return req, nil
 }
 
-func callUpstream(ctx context.Context, bodyStr string) (*http.Response, error) {
+func doUpstreamRequest(ctx context.Context, body []byte) (*http.Response, error) {
 	jwt, err := getJwt(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	req, err := upstreamRequest(ctx, jwt, bodyStr)
+	req, err := upstreamRequest(ctx, jwt, body)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	return httpClient.Do(req)
+}
+
+func callUpstream(ctx context.Context, body []byte) (*http.Response, error) {
+	resp, err := doUpstreamRequest(ctx, body)
 	if err != nil {
 		return nil, err
 	}
@@ -242,20 +245,11 @@ func callUpstream(ctx context.Context, bodyStr string) (*http.Response, error) {
 	for (resp.StatusCode == 401 || resp.StatusCode == 403) && retries < maxAuthRetries {
 		resp.Body.Close()
 		retries++
-
 		jwtMu.Lock()
-		jwtCached = nil // invalidate cache
+		jwtCached = nil
 		jwtMu.Unlock()
 
-		jwt, err = getJwt(ctx)
-		if err != nil {
-			return nil, err
-		}
-		req, err = upstreamRequest(ctx, jwt, bodyStr)
-		if err != nil {
-			return nil, err
-		}
-		resp, err = http.DefaultClient.Do(req)
+		resp, err = doUpstreamRequest(ctx, body)
 		if err != nil {
 			return nil, err
 		}
@@ -264,6 +258,8 @@ func callUpstream(ctx context.Context, bodyStr string) (*http.Response, error) {
 }
 
 // --- http helpers ---
+
+var errBodyTooLarge = fmt.Errorf("request body exceeds %d bytes", maxBodyBytes)
 
 func urlPath(u string) string {
 	if i := strings.Index(u, "?"); i != -1 {
@@ -309,49 +305,60 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func readBody(r *http.Request) ([]byte, error) {
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(bodyBytes) > maxBodyBytes {
+		return nil, errBodyTooLarge
+	}
+	return bodyBytes, nil
+}
+
+func readBodyOrErr(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	body, err := readBody(r)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errBodyTooLarge) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeJSON(w, status, map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": err.Error(),
+				"type":    "invalid_request_error",
+			},
+		})
+		return nil, false
+	}
+	return body, true
+}
+
+func writeProxyError(w http.ResponseWriter, ctx context.Context, err error) {
+	status := http.StatusBadGateway
+	if ctx.Err() != nil {
+		status = 499 // client closed request
+	}
+	writeJSON(w, status, map[string]interface{}{
+		"error": map[string]interface{}{
+			"message": err.Error(),
+			"type":    "proxy_error",
+		},
+	})
+}
+
 func handleChat(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 
-	// Read body with size limit.
-	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
-			"error": map[string]interface{}{
-				"message": err.Error(),
-				"type":    "invalid_request_error",
-			},
-		})
+	bodyBytes, ok := readBodyOrErr(w, r)
+	if !ok {
 		return
 	}
-	if len(bodyBytes) > maxBodyBytes {
-		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]interface{}{
-			"error": map[string]interface{}{
-				"message": fmt.Sprintf("request body exceeds %d bytes", maxBodyBytes),
-				"type":    "invalid_request_error",
-			},
-		})
-		return
-	}
-	bodyStr := string(bodyBytes)
 
 	ctx := r.Context()
-	resp, err := callUpstream(ctx, bodyStr)
+	resp, err := callUpstream(ctx, bodyBytes)
 	if err != nil {
-		if ctx.Err() != nil {
-			writeJSON(w, 499, map[string]interface{}{ // 499 = client closed request
-				"error": map[string]interface{}{
-					"message": err.Error(),
-					"type":    "proxy_error",
-				},
-			})
-			return
-		}
-		writeJSON(w, http.StatusBadGateway, map[string]interface{}{
-			"error": map[string]interface{}{
-				"message": err.Error(),
-				"type":    "proxy_error",
-			},
-		})
+		writeProxyError(w, ctx, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -363,11 +370,11 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(resp.StatusCode)
 
 	// Stream the body. Clear write deadline for long-lived SSE connections.
 	if flusher, ok := w.(http.Flusher); ok {
 		http.NewResponseController(w).SetWriteDeadline(time.Time{})
+		w.WriteHeader(resp.StatusCode)
 		buf := make([]byte, 4096)
 		for {
 			n, readErr := resp.Body.Read(buf)
@@ -382,11 +389,24 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
+		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
 	}
 }
 
 // --- anthropic translation ---
+
+func extractUpstreamError(body []byte) string {
+	var errResp struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &errResp) == nil && errResp.Error.Message != "" {
+		return errResp.Error.Message
+	}
+	return string(body)
+}
 
 type anthropicMsgReq struct {
 	Model         string         `json:"model"`
@@ -491,7 +511,25 @@ func openaiToAnthropic(openaiBody []byte, model string) map[string]interface{} {
 			CompletionTokens int `json:"completion_tokens"`
 		} `json:"usage"`
 	}
-	json.Unmarshal(openaiBody, &oa)
+	if err := json.Unmarshal(openaiBody, &oa); err != nil {
+		// Try to extract upstream error message before giving up.
+		var errResp struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		msg := "[upstream response parse error]"
+		if json.Unmarshal(openaiBody, &errResp) == nil && errResp.Error.Message != "" {
+			msg = errResp.Error.Message
+		}
+		return map[string]interface{}{
+			"id":      "msg_" + randomID(),
+			"type":    "message",
+			"role":    "assistant",
+			"content": []interface{}{map[string]interface{}{"type": "text", "text": msg}},
+			"model":   model,
+		}
+	}
 
 	stopReason := "end_turn"
 	if len(oa.Choices) > 0 && oa.Choices[0].FinishReason != nil {
@@ -525,9 +563,11 @@ func openaiToAnthropic(openaiBody []byte, model string) map[string]interface{} {
 }
 
 func emitSSE(w io.Writer, flusher http.Flusher, event string, data interface{}) error {
-	jsonBytes, _ := json.Marshal(data)
-	_, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, jsonBytes)
+	jsonBytes, err := json.Marshal(data)
 	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, jsonBytes); err != nil {
 		return err
 	}
 	flusher.Flush()
@@ -536,8 +576,57 @@ func emitSSE(w io.Writer, flusher http.Flusher, event string, data interface{}) 
 
 func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flusher http.Flusher, model string, inputTokens int) error {
 	msgID := "msg_" + randomID()
-	var started, blockStarted bool
+	var started, blockStarted, stopped bool
 	var outputTokens int
+
+	emitMessageStart := func() error {
+		return emitSSE(w, flusher, "message_start", map[string]interface{}{
+			"type": "message_start",
+			"message": map[string]interface{}{
+				"id":            msgID,
+				"type":          "message",
+				"role":          "assistant",
+				"content":       []interface{}{},
+				"model":         model,
+				"stop_reason":   nil,
+				"stop_sequence": nil,
+				"usage": map[string]int{
+					"input_tokens":  inputTokens,
+					"output_tokens": 0,
+				},
+			},
+		})
+	}
+	emitContentBlockStart := func() error {
+		return emitSSE(w, flusher, "content_block_start", map[string]interface{}{
+			"type":          "content_block_start",
+			"index":         0,
+			"content_block": map[string]interface{}{"type": "text", "text": ""},
+		})
+	}
+	emitStopEvents := func(stopReason string) error {
+		if err := emitSSE(w, flusher, "content_block_stop", map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": 0,
+		}); err != nil {
+			return err
+		}
+		if err := emitSSE(w, flusher, "message_delta", map[string]interface{}{
+			"type": "message_delta",
+			"delta": map[string]interface{}{
+				"stop_reason":   stopReason,
+				"stop_sequence": nil,
+			},
+			"usage": map[string]int{
+				"output_tokens": outputTokens,
+			},
+		}); err != nil {
+			return err
+		}
+		return emitSSE(w, flusher, "message_stop", map[string]interface{}{
+			"type": "message_stop",
+		})
+	}
 
 	scanner := bufio.NewScanner(upstream)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -555,6 +644,23 @@ func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flush
 		}
 		data := strings.TrimPrefix(line, "data: ")
 		if data == "[DONE]" {
+			if !started {
+				started = true
+				if err := emitMessageStart(); err != nil {
+					return err
+				}
+			}
+			if !blockStarted {
+				blockStarted = true
+				if err := emitContentBlockStart(); err != nil {
+					return err
+				}
+			}
+			if !stopped {
+				if err := emitStopEvents("end_turn"); err != nil {
+					return err
+				}
+			}
 			break
 		}
 
@@ -581,33 +687,14 @@ func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flush
 
 		if !started {
 			started = true
-			if err := emitSSE(w, flusher, "message_start", map[string]interface{}{
-				"type": "message_start",
-				"message": map[string]interface{}{
-					"id":            msgID,
-					"type":          "message",
-					"role":          "assistant",
-					"content":       []interface{}{},
-					"model":         model,
-					"stop_reason":   nil,
-					"stop_sequence": nil,
-					"usage": map[string]int{
-						"input_tokens":  inputTokens,
-						"output_tokens": 0,
-					},
-				},
-			}); err != nil {
+			if err := emitMessageStart(); err != nil {
 				return err
 			}
 		}
 
 		if !blockStarted {
 			blockStarted = true
-			if err := emitSSE(w, flusher, "content_block_start", map[string]interface{}{
-				"type":          "content_block_start",
-				"index":         0,
-				"content_block": map[string]interface{}{"type": "text", "text": ""},
-			}); err != nil {
+			if err := emitContentBlockStart(); err != nil {
 				return err
 			}
 		}
@@ -626,34 +713,12 @@ func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flush
 		}
 
 		if choice.FinishReason != nil {
+			stopped = true
 			if chunk.Usage != nil {
 				inputTokens = chunk.Usage.PromptTokens
 				outputTokens = chunk.Usage.CompletionTokens
 			}
-
-			if err := emitSSE(w, flusher, "content_block_stop", map[string]interface{}{
-				"type":  "content_block_stop",
-				"index": 0,
-			}); err != nil {
-				return err
-			}
-
-			if err := emitSSE(w, flusher, "message_delta", map[string]interface{}{
-				"type": "message_delta",
-				"delta": map[string]interface{}{
-					"stop_reason":   mapFinishReason(*choice.FinishReason),
-					"stop_sequence": nil,
-				},
-				"usage": map[string]int{
-					"output_tokens": outputTokens,
-				},
-			}); err != nil {
-				return err
-			}
-
-			if err := emitSSE(w, flusher, "message_stop", map[string]interface{}{
-				"type": "message_stop",
-			}); err != nil {
+			if err := emitStopEvents(mapFinishReason(*choice.FinishReason)); err != nil {
 				return err
 			}
 		}
@@ -664,20 +729,8 @@ func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flush
 func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
 
-	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
-			"error": map[string]interface{}{"message": err.Error(), "type": "invalid_request_error"},
-		})
-		return
-	}
-	if len(bodyBytes) > maxBodyBytes {
-		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]interface{}{
-			"error": map[string]interface{}{
-				"message": fmt.Sprintf("request body exceeds %d bytes", maxBodyBytes),
-				"type":    "invalid_request_error",
-			},
-		})
+	bodyBytes, ok := readBodyOrErr(w, r)
+	if !ok {
 		return
 	}
 
@@ -699,17 +752,9 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	resp, err := callUpstream(ctx, string(oaBody))
+	resp, err := callUpstream(ctx, oaBody)
 	if err != nil {
-		if ctx.Err() != nil {
-			writeJSON(w, 499, map[string]interface{}{
-				"error": map[string]interface{}{"message": err.Error(), "type": "proxy_error"},
-			})
-			return
-		}
-		writeJSON(w, http.StatusBadGateway, map[string]interface{}{
-			"error": map[string]interface{}{"message": err.Error(), "type": "proxy_error"},
-		})
+		writeProxyError(w, ctx, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -729,9 +774,12 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		// If upstream returned an error status, relay it as Anthropic error.
 		if resp.StatusCode >= 400 {
 			errBody, _ := io.ReadAll(resp.Body)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(resp.StatusCode)
-			w.Write(errBody)
+			writeJSON(w, resp.StatusCode, map[string]interface{}{
+				"error": map[string]interface{}{
+					"type":    "api_error",
+					"message": extractUpstreamError(errBody),
+				},
+			})
 			return
 		}
 
@@ -749,9 +797,12 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	// Non-streaming.
 	resBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		w.Write(resBody)
+		writeJSON(w, resp.StatusCode, map[string]interface{}{
+			"error": map[string]interface{}{
+				"type":    "api_error",
+				"message": extractUpstreamError(resBody),
+			},
+		})
 		return
 	}
 
@@ -759,11 +810,19 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, resp.StatusCode, anthropicResp)
 }
 
-// countTokens estimates input tokens from the OpenAI request (approx: 1 token ≈ 4 chars).
+// countTokens estimates input tokens from the OpenAI request.
+// Uses a rough heuristic: ASCII ≈ 4 chars/token, CJK ≈ 1.5 chars/token.
 func countTokens(req map[string]interface{}) int {
 	body, _ := json.Marshal(req)
-	chars := len(body)
-	return chars / 4
+	var ascii, nonASCII int
+	for i := 0; i < len(body); i++ {
+		if body[i] < 128 {
+			ascii++
+		} else {
+			nonASCII++
+		}
+	}
+	return ascii/4 + nonASCII*2/3
 }
 
 // --- server ---
