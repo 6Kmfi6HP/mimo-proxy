@@ -29,9 +29,8 @@ const (
 	defaultBaseURL      = "https://api.xiaomimimo.com"
 	jwtRefreshBuffer    = 5 * time.Minute
 	jwtDefaultTTL       = 50 * time.Minute
-	maxBodyBytes        = 32 * 1024 * 1024
-	maxAuthRetries      = 1
-	requestTimeout      = 5 * time.Minute
+	maxBodyBytes   = 32 * 1024 * 1024
+	requestTimeout = 5 * time.Minute
 	shutdownGracePeriod = 25 * time.Second
 )
 
@@ -105,7 +104,6 @@ type jwtEntry struct {
 var (
 	jwtMu     sync.Mutex
 	jwtCached *jwtEntry
-	jwtFlight = &sync.Mutex{} // inflight flag + lock
 )
 
 func parseExp(jwt string) int64 {
@@ -162,52 +160,46 @@ func bootstrap(ctx context.Context) (*jwtEntry, error) {
 	return &jwtEntry{jwt: data.Jwt, exp: parseExp(data.Jwt)}, nil
 }
 
-// getJwt returns a valid JWT, refreshing if needed.
-// It implements inflight-deduplication: only one goroutine refreshes at a time.
+// getJwt returns the cached JWT. The background refresher keeps it fresh.
 func getJwt(ctx context.Context) (string, error) {
-	const maxJwtRetries = 3
-	for attempt := 0; attempt < maxJwtRetries; attempt++ {
-		jwtMu.Lock()
-		if jwtCached != nil && jwtCached.exp-time.Now().UnixMilli() > jwtRefreshBuffer.Milliseconds() {
-			j := jwtCached.jwt
-			jwtMu.Unlock()
-			return j, nil
-		}
-
-		// Try to acquire the inflight lock.
-		if !jwtFlight.TryLock() {
-			// Another goroutine is refreshing; wait for it to finish.
-			jwtMu.Unlock()
-			jwtFlight.Lock()
-			jwtFlight.Unlock()
-
-			// Re-check cache — the refresh may have succeeded or failed.
-			jwtMu.Lock()
-			if jwtCached != nil {
-				j := jwtCached.jwt
-				jwtMu.Unlock()
-				return j, nil
-			}
-			jwtMu.Unlock()
-			// Cache still nil (refresh failed); loop to retry.
-			continue
-		}
-		jwtMu.Unlock()
-
-		entry, err := bootstrap(ctx)
-		jwtMu.Lock()
-		if err == nil {
-			jwtCached = entry
-		}
-		jwtMu.Unlock()
-		jwtFlight.Unlock()
-
-		if err != nil {
-			return "", err
-		}
-		return entry.jwt, nil
+	jwtMu.Lock()
+	defer jwtMu.Unlock()
+	if jwtCached != nil {
+		return jwtCached.jwt, nil
 	}
-	return "", fmt.Errorf("jwt refresh failed after %d attempts", maxJwtRetries)
+	return "", fmt.Errorf("no JWT available")
+}
+
+// startJwtRefresher proactively keeps the JWT fresh via a background goroutine.
+func startJwtRefresher(ctx context.Context) {
+	// Initial fill.
+	if entry, err := bootstrap(ctx); err == nil {
+		jwtMu.Lock()
+		jwtCached = entry
+		jwtMu.Unlock()
+	}
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				jwtMu.Lock()
+				needsRefresh := jwtCached == nil || jwtCached.exp-time.Now().UnixMilli() <= jwtRefreshBuffer.Milliseconds()
+				jwtMu.Unlock()
+				if needsRefresh {
+					if entry, err := bootstrap(ctx); err == nil {
+						jwtMu.Lock()
+						jwtCached = entry
+						jwtMu.Unlock()
+					}
+				}
+			}
+		}
+	}()
 }
 
 // --- upstream ---
@@ -223,7 +215,7 @@ func upstreamRequest(ctx context.Context, jwt string, body []byte) (*http.Reques
 	return req, nil
 }
 
-func doUpstreamRequest(ctx context.Context, body []byte) (*http.Response, error) {
+func callUpstream(ctx context.Context, body []byte) (*http.Response, error) {
 	jwt, err := getJwt(ctx)
 	if err != nil {
 		return nil, err
@@ -233,28 +225,6 @@ func doUpstreamRequest(ctx context.Context, body []byte) (*http.Response, error)
 		return nil, err
 	}
 	return httpClient.Do(req)
-}
-
-func callUpstream(ctx context.Context, body []byte) (*http.Response, error) {
-	resp, err := doUpstreamRequest(ctx, body)
-	if err != nil {
-		return nil, err
-	}
-
-	retries := 0
-	for (resp.StatusCode == 401 || resp.StatusCode == 403) && retries < maxAuthRetries {
-		resp.Body.Close()
-		retries++
-		jwtMu.Lock()
-		jwtCached = nil
-		jwtMu.Unlock()
-
-		resp, err = doUpstreamRequest(ctx, body)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return resp, nil
 }
 
 // --- http helpers ---
@@ -443,6 +413,27 @@ type anthropicTool struct {
 	InputSchema interface{} `json:"input_schema"`
 }
 
+// extractImageURL converts an Anthropic image content block to a URL string.
+func extractImageURL(b map[string]interface{}) string {
+	source, ok := b["source"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	switch source["type"] {
+	case "base64":
+		mediaType, _ := source["media_type"].(string)
+		data, _ := source["data"].(string)
+		if mediaType != "" && data != "" {
+			return "data:" + mediaType + ";base64," + data
+		}
+	case "url":
+		if url, _ := source["url"].(string); url != "" {
+			return url
+		}
+	}
+	return ""
+}
+
 // extractText handles Anthropic's polymorphic content field (string or []contentBlock).
 func extractText(v interface{}) string {
 	switch c := v.(type) {
@@ -590,7 +581,7 @@ func anthropicToOpenAI(req anthropicMsgReq) map[string]interface{} {
 		// Anthropic user messages may contain tool_result blocks.
 		if m.Role == "user" {
 			if blocks, ok := content.([]interface{}); ok {
-				var textParts []string
+				var contentParts []interface{} // text + image_url blocks
 				var toolResults []interface{}
 				for _, block := range blocks {
 					b, ok := block.(map[string]interface{})
@@ -600,7 +591,19 @@ func anthropicToOpenAI(req anthropicMsgReq) map[string]interface{} {
 					switch b["type"] {
 					case "text":
 						if txt, _ := b["text"].(string); txt != "" {
-							textParts = append(textParts, txt)
+							contentParts = append(contentParts, map[string]interface{}{
+								"type": "text",
+								"text": txt,
+							})
+						}
+					case "image":
+						if url := extractImageURL(b); url != "" {
+							contentParts = append(contentParts, map[string]interface{}{
+								"type": "image_url",
+								"image_url": map[string]interface{}{
+									"url": url,
+								},
+							})
 						}
 					case "tool_result":
 						resultContent := ""
@@ -622,12 +625,27 @@ func anthropicToOpenAI(req anthropicMsgReq) map[string]interface{} {
 						})
 					}
 				}
-				// Emit text parts as a regular user message, then tool results.
-				if len(textParts) > 0 {
-					messages = append(messages, map[string]interface{}{
-						"role":    "user",
-						"content": strings.Join(textParts, ""),
-					})
+				// Emit content parts as a user message, then tool results.
+				if len(contentParts) > 0 {
+					if len(contentParts) == 1 {
+						// Single text block → use string content.
+						if p, ok := contentParts[0].(map[string]interface{}); ok && p["type"] == "text" {
+							messages = append(messages, map[string]interface{}{
+								"role":    "user",
+								"content": p["text"],
+							})
+						} else {
+							messages = append(messages, map[string]interface{}{
+								"role":    "user",
+								"content": contentParts,
+							})
+						}
+					} else {
+						messages = append(messages, map[string]interface{}{
+							"role":    "user",
+							"content": contentParts,
+						})
+					}
 				}
 				for _, tr := range toolResults {
 					messages = append(messages, tr)
@@ -1245,6 +1263,9 @@ func main() {
 		WriteTimeout: requestTimeout,
 		IdleTimeout:  2 * requestTimeout,
 	}
+
+	// Start JWT auto-refresh in background.
+	startJwtRefresher(context.Background())
 
 	// Start server in background.
 	go func() {
