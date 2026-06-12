@@ -456,6 +456,27 @@ type anthropicTool struct {
 	InputSchema interface{} `json:"input_schema"`
 }
 
+// extractImageURL converts an Anthropic image content block to a URL string.
+func extractImageURL(b map[string]interface{}) string {
+	source, ok := b["source"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	switch source["type"] {
+	case "base64":
+		mediaType, _ := source["media_type"].(string)
+		data, _ := source["data"].(string)
+		if mediaType != "" && data != "" {
+			return "data:" + mediaType + ";base64," + data
+		}
+	case "url":
+		if url, _ := source["url"].(string); url != "" {
+			return url
+		}
+	}
+	return ""
+}
+
 // extractText handles Anthropic's polymorphic content field (string or []contentBlock).
 func extractText(v interface{}) string {
 	switch c := v.(type) {
@@ -603,7 +624,7 @@ func anthropicToOpenAI(req anthropicMsgReq) map[string]interface{} {
 		// Anthropic user messages may contain tool_result blocks.
 		if m.Role == "user" {
 			if blocks, ok := content.([]interface{}); ok {
-				var textParts []string
+				var contentParts []interface{} // text + image_url blocks
 				var toolResults []interface{}
 				for _, block := range blocks {
 					b, ok := block.(map[string]interface{})
@@ -613,7 +634,19 @@ func anthropicToOpenAI(req anthropicMsgReq) map[string]interface{} {
 					switch b["type"] {
 					case "text":
 						if txt, _ := b["text"].(string); txt != "" {
-							textParts = append(textParts, txt)
+							contentParts = append(contentParts, map[string]interface{}{
+								"type": "text",
+								"text": txt,
+							})
+						}
+					case "image":
+						if url := extractImageURL(b); url != "" {
+							contentParts = append(contentParts, map[string]interface{}{
+								"type": "image_url",
+								"image_url": map[string]interface{}{
+									"url": url,
+								},
+							})
 						}
 					case "tool_result":
 						resultContent := ""
@@ -635,12 +668,27 @@ func anthropicToOpenAI(req anthropicMsgReq) map[string]interface{} {
 						})
 					}
 				}
-				// Emit text parts as a regular user message, then tool results.
-				if len(textParts) > 0 {
-					messages = append(messages, map[string]interface{}{
-						"role":    "user",
-						"content": strings.Join(textParts, ""),
-					})
+				// Emit content parts as a user message, then tool results.
+				if len(contentParts) > 0 {
+					if len(contentParts) == 1 {
+						// Single text block → use string content.
+						if p, ok := contentParts[0].(map[string]interface{}); ok && p["type"] == "text" {
+							messages = append(messages, map[string]interface{}{
+								"role":    "user",
+								"content": p["text"],
+							})
+						} else {
+							messages = append(messages, map[string]interface{}{
+								"role":    "user",
+								"content": contentParts,
+							})
+						}
+					} else {
+						messages = append(messages, map[string]interface{}{
+							"role":    "user",
+							"content": contentParts,
+						})
+					}
 				}
 				for _, tr := range toolResults {
 					messages = append(messages, tr)
