@@ -136,6 +136,7 @@ func bootstrap(ctx context.Context) (*jwtEntry, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "mimocode/1.0.0")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -212,6 +213,7 @@ func upstreamRequest(ctx context.Context, jwt string, body []byte) (*http.Reques
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+jwt)
 	req.Header.Set("X-Mimo-Source", "mimocode-cli-free")
+	req.Header.Set("User-Agent", "mimocode/1.0.0")
 	return req, nil
 }
 
