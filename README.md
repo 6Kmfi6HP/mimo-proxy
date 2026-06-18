@@ -11,6 +11,7 @@ MiMoCode Free API 的反向代理，支持 OpenAI 和 Anthropic 格式。
 - 自动刷新 JWT
 - 支持 reasoning_content (思考过程)
 - 跨平台编译 (Linux, Windows, macOS)
+- 仅支持 `mimo-auto` 模型（上游限制）
 
 ## 安装
 
@@ -25,12 +26,6 @@ go build -o mimo-proxy .
 ```
 
 ## 配置
-
-复制示例配置文件：
-
-```bash
-cp config.example.yaml config.yaml
-```
 
 编辑 `config.yaml`：
 
@@ -66,7 +61,7 @@ api_key: ""
 curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4",
+    "model": "mimo-auto",
     "stream": true,
     "messages": [
       {"role": "user", "content": "你好"}
@@ -80,7 +75,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 curl -X POST http://localhost:5000/v1/messages \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-3-opus-20240229",
+    "model": "mimo-auto",
     "max_tokens": 100,
     "stream": true,
     "messages": [
@@ -98,7 +93,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key" \
   -d '{
-    "model": "gpt-4",
+    "model": "mimo-auto",
     "messages": [
       {"role": "user", "content": "你好"}
     ]
