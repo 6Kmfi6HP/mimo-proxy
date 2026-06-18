@@ -1301,20 +1301,27 @@ func checkAPIKey(w http.ResponseWriter, r *http.Request) bool {
 		return true // No API key configured, allow all.
 	}
 
-	auth := r.Header.Get("Authorization")
-	if auth == "" {
+	// Support "Authorization: Bearer <key>" (OpenAI style)
+	key := ""
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		key = strings.TrimPrefix(auth, "Bearer ")
+	}
+	// Also check "x-api-key" header (Anthropic style)
+	if key == "" {
+		key = r.Header.Get("x-api-key")
+	}
+
+	if key == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
 			"error": map[string]interface{}{
-				"message": "missing Authorization header",
+				"message": "missing API key (use Authorization: Bearer or x-api-key)",
 				"type":    "authentication_error",
 			},
 		})
 		return false
 	}
 
-	// Support "Bearer <key>" format.
-	token := strings.TrimPrefix(auth, "Bearer ")
-	if token != apiKey {
+	if key != apiKey {
 		writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
 			"error": map[string]interface{}{
 				"message": "invalid API key",
