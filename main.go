@@ -20,6 +20,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // --- config ---
@@ -32,14 +34,53 @@ const (
 	maxBodyBytes   = 32 * 1024 * 1024
 	requestTimeout = 5 * time.Minute
 	shutdownGracePeriod = 25 * time.Second
+	// antiAbuseMarker is required in the system message to pass upstream's anti-abuse check.
+	antiAbuseMarker = "You are MiMoCode, an interactive CLI tool that helps users with software engineering tasks."
 )
 
 var (
 	port         string
 	bootstrapURL string
 	chatURL      string
+	apiKey       string
 	httpClient   = &http.Client{Timeout: requestTimeout + 30*time.Second}
 )
+
+// Config represents the configuration file structure.
+type Config struct {
+	Port     string `yaml:"port"`
+	APIKey   string `yaml:"api_key"`
+	BaseURL  string `yaml:"base_url"`
+}
+
+// loadConfig reads the configuration from config.yaml.
+func loadConfig() Config {
+	cfg := Config{
+		Port:    defaultPort,
+		BaseURL: defaultBaseURL,
+	}
+
+	data, err := os.ReadFile("config.yaml")
+	if err != nil {
+		// Config file is optional, use defaults.
+		return cfg
+	}
+
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		log.Printf("warning: failed to parse config.yaml: %v", err)
+		return cfg
+	}
+
+	// Apply defaults for empty fields.
+	if cfg.Port == "" {
+		cfg.Port = defaultPort
+	}
+	if cfg.BaseURL == "" {
+		cfg.BaseURL = defaultBaseURL
+	}
+
+	return cfg
+}
 
 // --- fingerprint ---
 
@@ -92,6 +133,12 @@ func randomID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return fmt.Sprintf("%08x%08x%08x%08x", b[0:4], b[4:8], b[8:12], b[12:16])
+}
+
+func randomHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("%x", b)
 }
 
 // --- jwt cache ---
@@ -213,6 +260,7 @@ func upstreamRequest(ctx context.Context, jwt string, body []byte) (*http.Reques
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+jwt)
 	req.Header.Set("X-Mimo-Source", "mimocode-cli-free")
+	req.Header.Set("x-session-affinity", "ses_"+randomHex(12))
 	req.Header.Set("User-Agent", "mimocode/1.0.0")
 	return req, nil
 }
@@ -277,6 +325,46 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ensureAntiAbuseMarker ensures the system message contains the anti-abuse marker
+// and forces the model to "mimo-auto" (the only supported model).
+func ensureAntiAbuseMarker(body []byte) []byte {
+	var raw map[string]interface{}
+	if json.Unmarshal(body, &raw) != nil {
+		return body
+	}
+
+	// Force model to mimo-auto.
+	raw["model"] = "mimo-auto"
+
+	msgs, ok := raw["messages"].([]interface{})
+	if !ok {
+		out, _ := json.Marshal(raw)
+		return out
+	}
+
+	// Check if first message is a system message with the marker.
+	hasMarker := false
+	if len(msgs) > 0 {
+		if msg, ok := msgs[0].(map[string]interface{}); ok && msg["role"] == "system" {
+			if text := extractText(msg["content"]); strings.Contains(text, antiAbuseMarker) {
+				hasMarker = true
+			}
+		}
+	}
+
+	// Prepend a system message with the marker if missing.
+	if !hasMarker {
+		sysMsg := map[string]interface{}{
+			"role":    "system",
+			"content": antiAbuseMarker,
+		}
+		raw["messages"] = append([]interface{}{sysMsg}, msgs...)
+	}
+
+	out, _ := json.Marshal(raw)
+	return out
+}
+
 func readBody(r *http.Request) ([]byte, error) {
 	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
@@ -326,6 +414,9 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+
+	// Ensure anti-abuse system message is present.
+	bodyBytes = ensureAntiAbuseMarker(bodyBytes)
 
 	ctx := r.Context()
 	resp, err := callUpstream(ctx, bodyBytes)
@@ -473,7 +564,7 @@ func mapFinishReason(r string) string {
 
 func anthropicToOpenAI(req anthropicMsgReq) map[string]interface{} {
 	oa := map[string]interface{}{
-		"model":    req.Model,
+		"model":    "mimo-auto", // Force to the only supported model.
 		"messages": []interface{}{},
 		"stream":   req.Stream,
 	}
@@ -518,8 +609,16 @@ func anthropicToOpenAI(req anthropicMsgReq) map[string]interface{} {
 
 	messages := oa["messages"].([]interface{})
 
-	// system → prepend as system message
-	if sysText := extractText(req.System); sysText != "" {
+	// system → prepend as system message (ensure anti-abuse marker is present)
+	sysText := extractText(req.System)
+	if !strings.Contains(sysText, antiAbuseMarker) {
+		if sysText != "" {
+			sysText = antiAbuseMarker + "\n\n" + sysText
+		} else {
+			sysText = antiAbuseMarker
+		}
+	}
+	if sysText != "" {
 		messages = append(messages, map[string]interface{}{
 			"role":    "system",
 			"content": sysText,
@@ -1196,17 +1295,55 @@ func countTokens(req map[string]interface{}) int {
 	return ascii/4 + nonASCII*2/3
 }
 
+// checkAPIKey validates the API key if configured.
+func checkAPIKey(w http.ResponseWriter, r *http.Request) bool {
+	if apiKey == "" {
+		return true // No API key configured, allow all.
+	}
+
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": "missing Authorization header",
+				"type":    "authentication_error",
+			},
+		})
+		return false
+	}
+
+	// Support "Bearer <key>" format.
+	token := strings.TrimPrefix(auth, "Bearer ")
+	if token != apiKey {
+		writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": "invalid API key",
+				"type":    "authentication_error",
+			},
+		})
+		return false
+	}
+
+	return true
+}
+
 // --- server ---
 
 func main() {
+	// Load configuration from config.yaml.
+	cfg := loadConfig()
+
+	// Environment variables override config file.
 	port = os.Getenv("PORT")
 	if port == "" {
-		port = defaultPort
+		port = cfg.Port
 	}
 	baseURL := strings.TrimRight(os.Getenv("MIMO_BASE_URL"), "/")
 	if baseURL == "" {
-		baseURL = defaultBaseURL
+		baseURL = cfg.BaseURL
 	}
+	apiKey = cfg.APIKey
+
 	bootstrapURL = baseURL + "/api/free-ai/bootstrap"
 	chatURL = baseURL + "/api/free-ai/openai/chat"
 
@@ -1238,9 +1375,19 @@ func main() {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		switch {
-		case r.Method == http.MethodGet && path == "/health":
+
+		// Health endpoint doesn't require authentication.
+		if r.Method == http.MethodGet && path == "/health" {
 			handleHealth(w, r)
+			return
+		}
+
+		// Check API key for all other endpoints.
+		if !checkAPIKey(w, r) {
+			return
+		}
+
+		switch {
 		case r.Method == http.MethodGet && (path == "/v1/models" || path == "/models"):
 			handleModels(w, r)
 		case r.Method == http.MethodPost && (path == "/v1/chat/completions" || path == "/chat/completions"):
@@ -1274,6 +1421,11 @@ func main() {
 		log.Printf("mimo-proxy listening on http://0.0.0.0:%s", port)
 		log.Printf("fingerprint:  %s", getFingerprint())
 		log.Printf("forwarding:   POST %s", chatURL)
+		if apiKey != "" {
+			log.Printf("api_key:      configured")
+		} else {
+			log.Printf("api_key:      not configured (open access)")
+		}
 		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 			log.Fatalf("server error: %v", err)
 		}

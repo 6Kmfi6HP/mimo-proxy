@@ -1,0 +1,11 @@
+# mimo-proxy 配置文件
+
+# 监听端口 (默认: 5000)
+port: 5000
+
+# API Key 认证 (可选，留空则不需要认证)
+# 客户端需要在 Authorization 头中提供: Bearer <api_key>
+api_key: ""
+
+# 上游 API 地址 (默认: https://api.xiaomimimo.com)
+# base_url: https://api.xiaomimimo.com
