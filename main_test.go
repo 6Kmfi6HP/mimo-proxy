@@ -220,3 +220,70 @@ func TestCallUpstreamRotatesFingerprintOnPersistentError(t *testing.T) {
 		t.Fatalf("bootstrap 3 client: got %q, expected a new fingerprint after rotation", bootstrapPings[2])
 	}
 }
+
+func TestCallUpstreamRetriesOnHighFrequencyBlock(t *testing.T) {
+	var (
+		mu             sync.Mutex
+		authHeaders    []string
+		bootstrapCalls int
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if strings.Contains(r.URL.Path, "bootstrap") {
+			bootstrapCalls++
+			json.NewEncoder(w).Encode(map[string]string{"jwt": fmt.Sprintf("jwt-%d", bootstrapCalls)})
+			return
+		}
+		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+		// 1st call: high-frequency block → should retry with fingerprint rotation.
+		// 2nd call: succeeds.
+		switch len(authHeaders) {
+		case 1:
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Detected high-frequency non-compliant requests from you. Please consciously comply with the platform usage agreement."})
+		default:
+			w.Write([]byte(`ok`))
+		}
+	}))
+	defer ts.Close()
+
+	oldBootstrap, oldChat := bootstrapURL, chatURL
+	bootstrapURL = ts.URL + "/bootstrap"
+	chatURL = ts.URL + "/chat"
+	t.Cleanup(func() { bootstrapURL, chatURL = oldBootstrap, oldChat })
+
+	jwtMu.Lock()
+	jwtCached = nil
+	jwtMu.Unlock()
+
+	// Seed a known fingerprint so we can detect rotation.
+	oldFingerprint := "test-fingerprint-seed"
+	fingerprintMu.Lock()
+	fingerprintVal = oldFingerprint
+	fingerprintMu.Unlock()
+	t.Cleanup(func() {
+		fingerprintMu.Lock()
+		fingerprintVal = ""
+		fingerprintMu.Unlock()
+	})
+
+	resp, err := callUpstream(context.Background(), []byte(`{}`))
+	if err != nil {
+		t.Fatalf("callUpstream: %v", err)
+	}
+	resp.Body.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(authHeaders) != 2 {
+		t.Fatalf("expected 2 upstream attempts, got %d", len(authHeaders))
+	}
+
+	// Should have bootstrapped twice: initial + after high-frequency block.
+	if bootstrapCalls != 2 {
+		t.Fatalf("expected 2 bootstrap calls, got %d", bootstrapCalls)
+	}
+}

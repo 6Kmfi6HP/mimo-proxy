@@ -365,16 +365,25 @@ func callUpstream(ctx context.Context, body []byte) (*http.Response, error) {
 			return nil, err
 		}
 
-		// Step 0: retry if Invalid Token. Step 1: retry on any error.
+		// Step 0: retry if Invalid Token or high-frequency block.
+		// Step 1: retry on any error with fingerprint rotation.
 		// Step 2: return regardless.
 		doRetry := false
 		switch step {
 		case 0:
-			if resp.StatusCode < 400 || !isInvalidToken(resp) {
+			if resp.StatusCode < 400 {
 				return resp, nil
 			}
-			// Invalid Token — clear bad token, re-bootstrap, retry.
-			doRetry = true
+			if isInvalidToken(resp) {
+				// Invalid Token — clear bad token, re-bootstrap, retry.
+				doRetry = true
+			} else if isHighFrequencyBlock(resp) {
+				// High-frequency block — rotate fingerprint for a fresh identity.
+				doRetry = true
+				rotateFingerprint()
+			} else {
+				return resp, nil
+			}
 		case 1:
 			if resp.StatusCode < 400 {
 				return resp, nil
@@ -417,6 +426,15 @@ func isInvalidToken(resp *http.Response) bool {
 	resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	return bytes.Contains(body, []byte("Invalid Token"))
+}
+
+// isHighFrequencyBlock drains the response body, re-wraps it for re-reading,
+// and reports whether it contains a high-frequency non-compliant block message.
+func isHighFrequencyBlock(resp *http.Response) bool {
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return bytes.Contains(body, []byte("high-frequency non-compliant"))
 }
 
 // --- http helpers ---
