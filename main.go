@@ -46,6 +46,9 @@ var (
 	chatURL      string
 	apiKey       string
 	httpClient   = &http.Client{Timeout: requestTimeout + 30*time.Second}
+
+	socks5Mu  sync.Mutex
+	socks5URL string
 )
 
 // Config represents the configuration file structure.
@@ -92,6 +95,17 @@ func socks5URLFromConfig(cfg Config) string {
 	return strings.TrimSpace(cfg.Socks5)
 }
 
+func redactProxyURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if u.User != nil {
+		u.User = url.User("***")
+	}
+	return u.String()
+}
+
 func configureHTTPClient(socks5URL string) error {
 	client := &http.Client{Timeout: requestTimeout + 30*time.Second}
 	if socks5URL == "" {
@@ -110,6 +124,7 @@ func configureHTTPClient(socks5URL string) error {
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DisableKeepAlives = true
 	if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
 		transport.DialContext = contextDialer.DialContext
 		transport.Dial = nil
@@ -120,6 +135,22 @@ func configureHTTPClient(socks5URL string) error {
 	client.Transport = transport
 	httpClient = client
 	return nil
+}
+
+// resetUpstreamConnection closes pooled links and rebuilds the client so the
+// same SOCKS5 server dials out with a fresh connection (new egress IP).
+func resetUpstreamConnection(reason string) {
+	socks5Mu.Lock()
+	defer socks5Mu.Unlock()
+
+	if t, ok := httpClient.Transport.(*http.Transport); ok {
+		t.CloseIdleConnections()
+	}
+	if err := configureHTTPClient(socks5URL); err != nil {
+		log.Printf("[proxy] reset connection failed reason=%s err=%v", reason, err)
+		return
+	}
+	log.Printf("[proxy] reset connection reason=%s", reason)
 }
 
 // --- fingerprint ---
@@ -143,6 +174,35 @@ func rotateFingerprint() string {
 	defer fingerprintMu.Unlock()
 	fingerprintVal = makeFingerprint()
 	return fingerprintVal
+}
+
+func shortFingerprint(fp string) string {
+	if len(fp) <= 16 {
+		return fp
+	}
+	return fp[:16] + "..."
+}
+
+func shortJWT(jwt string) string {
+	if len(jwt) <= 24 {
+		return jwt
+	}
+	return jwt[:24] + "..."
+}
+
+func truncateForLog(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
+}
+
+func drainResponseBody(resp *http.Response) []byte {
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return body
 }
 
 func makeFingerprint() string {
@@ -228,7 +288,9 @@ func parseExp(jwt string) int64 {
 }
 
 func bootstrap(ctx context.Context) (*jwtEntry, error) {
-	payload := map[string]string{"client": getFingerprint()}
+	fp := rotateFingerprint()
+	log.Printf("[bootstrap] fingerprint=%s", shortFingerprint(fp))
+	payload := map[string]string{"client": fp}
 	body, _ := json.Marshal(payload)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", bootstrapURL, bytes.NewReader(body))
@@ -240,12 +302,14 @@ func bootstrap(ctx context.Context) (*jwtEntry, error) {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		log.Printf("[bootstrap] fingerprint=%s error=%v", shortFingerprint(fp), err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		text, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
+		log.Printf("[bootstrap] fingerprint=%s status=%d body=%s", shortFingerprint(fp), resp.StatusCode, truncateForLog(string(text), 200))
 		return nil, fmt.Errorf("mimo bootstrap %d: %s", resp.StatusCode, string(text))
 	}
 
@@ -253,12 +317,17 @@ func bootstrap(ctx context.Context) (*jwtEntry, error) {
 		Jwt string `json:"jwt"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		log.Printf("[bootstrap] fingerprint=%s decode error=%v", shortFingerprint(fp), err)
 		return nil, fmt.Errorf("mimo bootstrap: %w", err)
 	}
 	if data.Jwt == "" {
+		log.Printf("[bootstrap] fingerprint=%s missing jwt", shortFingerprint(fp))
 		return nil, fmt.Errorf("mimo bootstrap: missing jwt")
 	}
-	return &jwtEntry{jwt: data.Jwt, exp: parseExp(data.Jwt)}, nil
+	entry := &jwtEntry{jwt: data.Jwt, exp: parseExp(data.Jwt)}
+	log.Printf("[bootstrap] ok fingerprint=%s jwt=%s exp=%s",
+		shortFingerprint(fp), shortJWT(data.Jwt), time.UnixMilli(entry.exp).Format(time.RFC3339))
+	return entry, nil
 }
 
 // getJwt returns a valid JWT, bootstrapping synchronously when the cache is
@@ -360,38 +429,52 @@ func callUpstream(ctx context.Context, body []byte) (*http.Response, error) {
 			return nil, err
 		}
 
+		log.Printf("[upstream] step=%d jwt=%s request", step, shortJWT(jwt))
 		resp, err := httpClient.Do(req)
 		if err != nil {
+			log.Printf("[upstream] step=%d network error=%v", step, err)
 			return nil, err
 		}
 
 		// Step 0: retry if Invalid Token or high-frequency block.
-		// Step 1: retry on any error with fingerprint rotation.
+		// Step 1: retry on any error (bootstrap assigns a fresh fingerprint).
 		// Step 2: return regardless.
 		doRetry := false
+		retryReason := ""
 		switch step {
 		case 0:
 			if resp.StatusCode < 400 {
+				log.Printf("[upstream] step=%d status=%d ok", step, resp.StatusCode)
 				return resp, nil
 			}
-			if isInvalidToken(resp) {
-				// Invalid Token — clear bad token, re-bootstrap, retry.
+			bodyBytes := drainResponseBody(resp)
+			log.Printf("[upstream] step=%d status=%d body=%s", step, resp.StatusCode, truncateForLog(string(bodyBytes), 300))
+			if bytes.Contains(bodyBytes, []byte("Invalid Token")) {
 				doRetry = true
-			} else if isHighFrequencyBlock(resp) {
-				// High-frequency block — rotate fingerprint for a fresh identity.
+				retryReason = "invalid_token"
+			} else if isRiskControlBlock(bodyBytes) {
 				doRetry = true
-				rotateFingerprint()
+				retryReason = "risk_control"
 			} else {
+				log.Printf("[upstream] step=%d non-retryable error", step)
 				return resp, nil
 			}
 		case 1:
 			if resp.StatusCode < 400 {
+				log.Printf("[upstream] step=%d status=%d ok", step, resp.StatusCode)
 				return resp, nil
 			}
-			// Still failing — rotate fingerprint for a fresh identity.
+			bodyBytes := drainResponseBody(resp)
+			log.Printf("[upstream] step=%d status=%d body=%s", step, resp.StatusCode, truncateForLog(string(bodyBytes), 300))
 			doRetry = true
-			rotateFingerprint()
+			retryReason = "persistent_error"
 		case 2:
+			if resp.StatusCode >= 400 {
+				bodyBytes := drainResponseBody(resp)
+				log.Printf("[upstream] step=%d status=%d final body=%s", step, resp.StatusCode, truncateForLog(string(bodyBytes), 300))
+			} else {
+				log.Printf("[upstream] step=%d status=%d ok", step, resp.StatusCode)
+			}
 			return resp, nil
 		}
 
@@ -399,6 +482,10 @@ func callUpstream(ctx context.Context, body []byte) (*http.Response, error) {
 			return resp, nil
 		}
 		resp.Body.Close()
+
+		log.Printf("[upstream] step=%d retry reason=%s", step, retryReason)
+
+		resetUpstreamConnection(retryReason)
 
 		// Clear bad token before re-bootstrapping.
 		jwtMu.Lock()
@@ -419,22 +506,9 @@ func callUpstream(ctx context.Context, body []byte) (*http.Response, error) {
 	panic("unreachable")
 }
 
-// isInvalidToken drains the response body, re-wraps it for re-reading,
-// and reports whether it contains "Invalid Token".
-func isInvalidToken(resp *http.Response) bool {
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	return bytes.Contains(body, []byte("Invalid Token"))
-}
-
-// isHighFrequencyBlock drains the response body, re-wraps it for re-reading,
-// and reports whether it contains a high-frequency non-compliant block message.
-func isHighFrequencyBlock(resp *http.Response) bool {
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	return bytes.Contains(body, []byte("high-frequency non-compliant"))
+func isRiskControlBlock(body []byte) bool {
+	return bytes.Contains(body, []byte("risk_control")) ||
+		bytes.Contains(body, []byte("high-frequency non-compliant"))
 }
 
 // --- http helpers ---
@@ -581,10 +655,12 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	resp, err := callUpstream(ctx, bodyBytes)
 	if err != nil {
+		log.Printf("[proxy] POST /v1/chat/completions upstream error=%v", err)
 		writeProxyError(w, ctx, err)
 		return
 	}
 	defer resp.Body.Close()
+	log.Printf("[proxy] POST /v1/chat/completions upstream status=%d", resp.StatusCode)
 
 	// Copy headers.
 	contentType := resp.Header.Get("Content-Type")
@@ -1510,7 +1586,7 @@ func main() {
 		baseURL = cfg.BaseURL
 	}
 	apiKey = cfg.APIKey
-	socks5URL := socks5URLFromConfig(cfg)
+	socks5URL = socks5URLFromConfig(cfg)
 	if err := configureHTTPClient(socks5URL); err != nil {
 		log.Fatalf("proxy configuration error: %v", err)
 	}
@@ -1598,7 +1674,7 @@ func main() {
 			log.Printf("api_key:      not configured (open access)")
 		}
 		if socks5URL != "" {
-			log.Printf("socks5:       configured")
+			log.Printf("socks5:       %s", redactProxyURL(socks5URL))
 		}
 		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 			log.Fatalf("server error: %v", err)

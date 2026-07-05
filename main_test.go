@@ -34,6 +34,35 @@ func TestSocks5URLFromConfigEnvOverridesConfig(t *testing.T) {
 	}
 }
 
+func TestResetUpstreamConnectionRebuildsTransport(t *testing.T) {
+	oldClient := httpClient
+	oldURL := socks5URL
+	t.Cleanup(func() {
+		httpClient = oldClient
+		socks5URL = oldURL
+	})
+
+	socks5URL = "socks5h://127.0.0.1:7890"
+	if err := configureHTTPClient(socks5URL); err != nil {
+		t.Fatalf("configureHTTPClient: %v", err)
+	}
+	first := httpClient.Transport
+
+	resetUpstreamConnection("risk_control")
+
+	second := httpClient.Transport
+	if first == second {
+		t.Fatal("expected new transport after reset")
+	}
+	transport, ok := second.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want *http.Transport", second)
+	}
+	if !transport.DisableKeepAlives {
+		t.Fatal("expected DisableKeepAlives on proxy transport")
+	}
+}
+
 func TestConfigureHTTPClientUsesSocks5HDialer(t *testing.T) {
 	oldClient := httpClient
 	t.Cleanup(func() { httpClient = oldClient })
@@ -133,6 +162,41 @@ func TestCallUpstreamInvalidTokenRetryOnceWithNewJwt(t *testing.T) {
 	}
 }
 
+func TestBootstrapUsesDistinctFingerprintEachCall(t *testing.T) {
+	fingerprintMu.Lock()
+	fingerprintVal = ""
+	fingerprintMu.Unlock()
+
+	var clients []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Client string `json:"client"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		clients = append(clients, req.Client)
+		json.NewEncoder(w).Encode(map[string]string{"jwt": "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjk5OTk5OTk5OTl9.x"})
+	}))
+	defer ts.Close()
+
+	old := bootstrapURL
+	bootstrapURL = ts.URL
+	t.Cleanup(func() { bootstrapURL = old })
+
+	for i := 0; i < 3; i++ {
+		if _, err := bootstrap(context.Background()); err != nil {
+			t.Fatalf("bootstrap %d: %v", i, err)
+		}
+	}
+	if len(clients) != 3 {
+		t.Fatalf("expected 3 bootstrap clients, got %d", len(clients))
+	}
+	for i := 1; i < len(clients); i++ {
+		if clients[i] == clients[i-1] {
+			t.Fatalf("bootstrap %d reused fingerprint %q", i+1, clients[i])
+		}
+	}
+}
+
 func TestCallUpstreamRotatesFingerprintOnPersistentError(t *testing.T) {
 	var (
 		mu             sync.Mutex
@@ -157,8 +221,8 @@ func TestCallUpstreamRotatesFingerprintOnPersistentError(t *testing.T) {
 		}
 		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
 		// 1st call: Invalid Token → retry (step 0).
-		// 2nd call: still fails with risk_control (step 1 rotate fingerprint).
-		// 3rd call: accept (step 2 — new identity).
+		// 2nd call: still fails with risk_control (step 1 re-bootstrap).
+		// 3rd call: accept (step 2).
 		switch len(authHeaders) {
 		case 1:
 			w.WriteHeader(http.StatusUnauthorized)
@@ -181,16 +245,9 @@ func TestCallUpstreamRotatesFingerprintOnPersistentError(t *testing.T) {
 	jwtCached = nil
 	jwtMu.Unlock()
 
-	// Seed a known fingerprint so we can detect rotation.
-	oldFingerprint := "test-fingerprint-seed"
 	fingerprintMu.Lock()
-	fingerprintVal = oldFingerprint
+	fingerprintVal = ""
 	fingerprintMu.Unlock()
-	t.Cleanup(func() {
-		fingerprintMu.Lock()
-		fingerprintVal = ""
-		fingerprintMu.Unlock()
-	})
 
 	resp, err := callUpstream(context.Background(), []byte(`{}`))
 	if err != nil {
@@ -205,19 +262,13 @@ func TestCallUpstreamRotatesFingerprintOnPersistentError(t *testing.T) {
 		t.Fatalf("expected 3 upstream attempts, got %d: %v", len(authHeaders), authHeaders)
 	}
 
-	// First bootstrap (initial getJwt) uses initial fingerprint.
-	// Second bootstrap (after Invalid Token) uses same fingerprint.
 	if len(bootstrapPings) < 3 {
-		t.Fatalf("expected 3 bootstraps (initial + Invalid-Token retry + fingerprint rotate), got %d: %v", len(bootstrapPings), bootstrapPings)
+		t.Fatalf("expected 3 bootstraps, got %d: %v", len(bootstrapPings), bootstrapPings)
 	}
-	if bootstrapPings[0] != oldFingerprint {
-		t.Fatalf("bootstrap 1 client: got %q, want %q", bootstrapPings[0], oldFingerprint)
-	}
-	if bootstrapPings[1] != oldFingerprint {
-		t.Fatalf("bootstrap 2 client: got %q, want %q (should be same before rotation)", bootstrapPings[1], oldFingerprint)
-	}
-	if bootstrapPings[2] == oldFingerprint {
-		t.Fatalf("bootstrap 3 client: got %q, expected a new fingerprint after rotation", bootstrapPings[2])
+	for i := 1; i < len(bootstrapPings); i++ {
+		if bootstrapPings[i] == bootstrapPings[i-1] {
+			t.Fatalf("bootstrap %d reused fingerprint %q", i+1, bootstrapPings[i])
+		}
 	}
 }
 
@@ -226,6 +277,7 @@ func TestCallUpstreamRetriesOnHighFrequencyBlock(t *testing.T) {
 		mu             sync.Mutex
 		authHeaders    []string
 		bootstrapCalls int
+		bootstrapPings []string
 	)
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -233,6 +285,11 @@ func TestCallUpstreamRetriesOnHighFrequencyBlock(t *testing.T) {
 		defer mu.Unlock()
 		if strings.Contains(r.URL.Path, "bootstrap") {
 			bootstrapCalls++
+			var req struct {
+				Client string `json:"client"`
+			}
+			json.NewDecoder(r.Body).Decode(&req)
+			bootstrapPings = append(bootstrapPings, req.Client)
 			json.NewEncoder(w).Encode(map[string]string{"jwt": fmt.Sprintf("jwt-%d", bootstrapCalls)})
 			return
 		}
@@ -258,16 +315,9 @@ func TestCallUpstreamRetriesOnHighFrequencyBlock(t *testing.T) {
 	jwtCached = nil
 	jwtMu.Unlock()
 
-	// Seed a known fingerprint so we can detect rotation.
-	oldFingerprint := "test-fingerprint-seed"
 	fingerprintMu.Lock()
-	fingerprintVal = oldFingerprint
+	fingerprintVal = ""
 	fingerprintMu.Unlock()
-	t.Cleanup(func() {
-		fingerprintMu.Lock()
-		fingerprintVal = ""
-		fingerprintMu.Unlock()
-	})
 
 	resp, err := callUpstream(context.Background(), []byte(`{}`))
 	if err != nil {
@@ -282,8 +332,10 @@ func TestCallUpstreamRetriesOnHighFrequencyBlock(t *testing.T) {
 		t.Fatalf("expected 2 upstream attempts, got %d", len(authHeaders))
 	}
 
-	// Should have bootstrapped twice: initial + after high-frequency block.
 	if bootstrapCalls != 2 {
 		t.Fatalf("expected 2 bootstrap calls, got %d", bootstrapCalls)
+	}
+	if len(bootstrapPings) != 2 || bootstrapPings[0] == bootstrapPings[1] {
+		t.Fatalf("expected distinct bootstrap fingerprints, got %v", bootstrapPings)
 	}
 }
