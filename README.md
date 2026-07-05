@@ -25,6 +25,27 @@ MiMoCode Free API 的反向代理，支持 OpenAI 和 Anthropic 格式。
 go build -o mimo-proxy .
 ```
 
+### Docker 镜像
+
+CI 会在推送到 `main` 或 `v*` tag 时发布 GHCR 镜像：
+
+```bash
+docker pull ghcr.io/6kmfi6hp/mimo-proxy:latest
+docker run --rm -p 5000:5000 -v "$PWD/config.yaml:/app/config.yaml:ro" ghcr.io/6kmfi6hp/mimo-proxy:latest
+```
+
+### Docker Compose 部署
+
+```bash
+docker compose up -d
+```
+
+默认使用 `ghcr.io/6kmfi6hp/mimo-proxy:latest`，并挂载当前目录的 `config.yaml` 到容器内 `/app/config.yaml`。如需指定镜像版本：
+
+```bash
+MIMO_PROXY_IMAGE=ghcr.io/6kmfi6hp/mimo-proxy:v0.1.0 docker compose up -d
+```
+
 ## 配置
 
 编辑 `config.yaml`：
@@ -46,6 +67,30 @@ api_key: ""
 
 - `PORT`: 监听端口
 - `MIMO_BASE_URL`: 上游 API 地址
+- `MIMO_SOCKS5`: SOCKS5 代理地址（优先级高于配置文件）
+
+### SOCKS5 代理
+
+如果网络环境需要代理访问上游 API，可以在 `config.yaml` 或环境变量中配置：
+
+```yaml
+# config.yaml
+socks5: "socks5h://100.74.21.88:7890"
+```
+
+或通过环境变量：
+
+```bash
+export MIMO_SOCKS5="socks5h://100.74.21.88:7890"
+```
+
+代理地址支持的格式：
+
+| 协议 | 示例 |
+|------|------|
+| SOCKS5 | `socks5://127.0.0.1:7890` |
+| SOCKS5 with auth | `socks5://user:pass@127.0.0.1:7890` |
+| SOCKS5H（代理端解析域名） | `socks5h://100.74.21.88:7890` |
 
 ## 使用
 

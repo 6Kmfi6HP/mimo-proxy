@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
@@ -21,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/net/proxy"
 	"gopkg.in/yaml.v3"
 )
 
@@ -31,8 +33,8 @@ const (
 	defaultBaseURL      = "https://api.xiaomimimo.com"
 	jwtRefreshBuffer    = 5 * time.Minute
 	jwtDefaultTTL       = 50 * time.Minute
-	maxBodyBytes   = 32 * 1024 * 1024
-	requestTimeout = 5 * time.Minute
+	maxBodyBytes        = 32 * 1024 * 1024
+	requestTimeout      = 5 * time.Minute
 	shutdownGracePeriod = 25 * time.Second
 	// antiAbuseMarker is required in the system message to pass upstream's anti-abuse check.
 	antiAbuseMarker = "You are MiMoCode, an interactive CLI tool that helps users with software engineering tasks."
@@ -48,9 +50,10 @@ var (
 
 // Config represents the configuration file structure.
 type Config struct {
-	Port     string `yaml:"port"`
-	APIKey   string `yaml:"api_key"`
-	BaseURL  string `yaml:"base_url"`
+	Port    string `yaml:"port"`
+	APIKey  string `yaml:"api_key"`
+	BaseURL string `yaml:"base_url"`
+	Socks5  string `yaml:"socks5"`
 }
 
 // loadConfig reads the configuration from config.yaml.
@@ -80,6 +83,43 @@ func loadConfig() Config {
 	}
 
 	return cfg
+}
+
+func socks5URLFromConfig(cfg Config) string {
+	if socks5 := strings.TrimSpace(os.Getenv("MIMO_SOCKS5")); socks5 != "" {
+		return socks5
+	}
+	return strings.TrimSpace(cfg.Socks5)
+}
+
+func configureHTTPClient(socks5URL string) error {
+	client := &http.Client{Timeout: requestTimeout + 30*time.Second}
+	if socks5URL == "" {
+		httpClient = client
+		return nil
+	}
+
+	u, err := url.Parse(socks5URL)
+	if err != nil {
+		return fmt.Errorf("parse socks5 proxy URL: %w", err)
+	}
+
+	dialer, err := proxy.FromURL(u, proxy.Direct)
+	if err != nil {
+		return fmt.Errorf("create socks5 proxy dialer: %w", err)
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+		transport.DialContext = contextDialer.DialContext
+		transport.Dial = nil
+	} else {
+		transport.DialContext = nil
+		transport.Dial = dialer.Dial
+	}
+	client.Transport = transport
+	httpClient = client
+	return nil
 }
 
 // --- fingerprint ---
@@ -183,7 +223,7 @@ func bootstrap(ctx context.Context) (*jwtEntry, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "mimocode/1.0.0")
+	req.Header.Set("User-Agent", "mimocode/0.1.4")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -472,23 +512,23 @@ func extractUpstreamError(body []byte) string {
 }
 
 type anthropicMsgReq struct {
-	Model         string          `json:"model"`
-	Messages      []anthropicMsg  `json:"messages"`
-	System        interface{}     `json:"system"`
-	MaxTokens     int             `json:"max_tokens"`
-	Temperature   *float64        `json:"temperature,omitempty"`
-	TopP          *float64        `json:"top_p,omitempty"`
-	StopSequences []string        `json:"stop_sequences,omitempty"`
-	Stream        bool            `json:"stream,omitempty"`
-	Tools         []anthropicTool `json:"tools,omitempty"`
-	ToolChoice    interface{}     `json:"tool_choice,omitempty"`
+	Model         string             `json:"model"`
+	Messages      []anthropicMsg     `json:"messages"`
+	System        interface{}        `json:"system"`
+	MaxTokens     int                `json:"max_tokens"`
+	Temperature   *float64           `json:"temperature,omitempty"`
+	TopP          *float64           `json:"top_p,omitempty"`
+	StopSequences []string           `json:"stop_sequences,omitempty"`
+	Stream        bool               `json:"stream,omitempty"`
+	Tools         []anthropicTool    `json:"tools,omitempty"`
+	ToolChoice    interface{}        `json:"tool_choice,omitempty"`
 	Thinking      *anthropicThinking `json:"thinking,omitempty"`
 	Metadata      *anthropicMetadata `json:"metadata,omitempty"`
 }
 
 type anthropicThinking struct {
-	Type        string `json:"type"`        // "enabled" or "disabled"
-	BudgetTokens int   `json:"budget_tokens,omitempty"`
+	Type         string `json:"type"` // "enabled" or "disabled"
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
 }
 
 type anthropicMetadata struct {
@@ -720,9 +760,9 @@ func anthropicToOpenAI(req anthropicMsgReq) map[string]interface{} {
 							resultContent = strings.Join(parts, "")
 						}
 						toolResults = append(toolResults, map[string]interface{}{
-							"role":       "tool",
+							"role":         "tool",
 							"tool_call_id": b["tool_use_id"],
-							"content":    resultContent,
+							"content":      resultContent,
 						})
 					}
 				}
@@ -915,10 +955,10 @@ func translateStream(ctx context.Context, upstream io.Reader, w io.Writer, flush
 
 	// Block index tracking: sequential, auto-assigned.
 	type blockState struct {
-		index   int
+		index     int
 		blockType string // "thinking", "text", "tool_use"
-		closed  bool
-		name    string // for tool_use
+		closed    bool
+		name      string // for tool_use
 	}
 	var blocks []*blockState
 	// Map from OpenAI tool_call index → blockState.
@@ -1350,6 +1390,10 @@ func main() {
 		baseURL = cfg.BaseURL
 	}
 	apiKey = cfg.APIKey
+	socks5URL := socks5URLFromConfig(cfg)
+	if err := configureHTTPClient(socks5URL); err != nil {
+		log.Fatalf("proxy configuration error: %v", err)
+	}
 
 	bootstrapURL = baseURL + "/api/free-ai/bootstrap"
 	chatURL = baseURL + "/api/free-ai/openai/chat"
@@ -1432,6 +1476,9 @@ func main() {
 			log.Printf("api_key:      configured")
 		} else {
 			log.Printf("api_key:      not configured (open access)")
+		}
+		if socks5URL != "" {
+			log.Printf("socks5:       configured")
 		}
 		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 			log.Fatalf("server error: %v", err)

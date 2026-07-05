@@ -9,3 +9,8 @@ api_key: ""
 
 # 上游 API 地址 (默认: https://api.xiaomimimo.com)
 # base_url: https://api.xiaomimimo.com
+
+# SOCKS5 代理地址 (可选)
+# 格式: socks5://127.0.0.1:7890 或 socks5h://127.0.0.1:7890
+# 也可以通过环境变量 MIMO_SOCKS5 设置
+socks5: "socks5h://100.74.21.88:7890"
