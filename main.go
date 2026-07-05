@@ -125,28 +125,41 @@ func configureHTTPClient(socks5URL string) error {
 // --- fingerprint ---
 
 var (
-	fingerprintOnce sync.Once
-	fingerprintVal  string
+	fingerprintMu  sync.Mutex
+	fingerprintVal string
 )
 
 func getFingerprint() string {
-	fingerprintOnce.Do(func() {
-		hostname, _ := os.Hostname()
-		if hostname == "" {
-			hostname = "unknown-host"
-		}
-		platform := runtime.GOOS
-		arch := runtime.GOARCH
-		username := "unknown-user"
-		if u, err := osUserInfo(); err == nil {
-			username = u
-		}
-		seed := fmt.Sprintf("%s|%s|%s|%s|%s",
-			hostname, platform, arch, username, randomUUID())
-		h := sha256.Sum256([]byte(seed))
-		fingerprintVal = fmt.Sprintf("%x", h)
-	})
+	fingerprintMu.Lock()
+	defer fingerprintMu.Unlock()
+	if fingerprintVal == "" {
+		fingerprintVal = makeFingerprint()
+	}
 	return fingerprintVal
+}
+
+func rotateFingerprint() string {
+	fingerprintMu.Lock()
+	defer fingerprintMu.Unlock()
+	fingerprintVal = makeFingerprint()
+	return fingerprintVal
+}
+
+func makeFingerprint() string {
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "unknown-host"
+	}
+	platform := runtime.GOOS
+	arch := runtime.GOARCH
+	username := "unknown-user"
+	if u, err := osUserInfo(); err == nil {
+		username = u
+	}
+	seed := fmt.Sprintf("%s|%s|%s|%s|%s",
+		hostname, platform, arch, username, randomUUID())
+	h := sha256.Sum256([]byte(seed))
+	return fmt.Sprintf("%x", h)
 }
 
 func osUserInfo() (string, error) {
@@ -248,14 +261,44 @@ func bootstrap(ctx context.Context) (*jwtEntry, error) {
 	return &jwtEntry{jwt: data.Jwt, exp: parseExp(data.Jwt)}, nil
 }
 
-// getJwt returns the cached JWT. The background refresher keeps it fresh.
+// getJwt returns a valid JWT, bootstrapping synchronously when the cache is
+// missing or near expiry. Falls back to a stale token only when the cache
+// still has time left and the refresh fails.
 func getJwt(ctx context.Context) (string, error) {
 	jwtMu.Lock()
-	defer jwtMu.Unlock()
-	if jwtCached != nil {
-		return jwtCached.jwt, nil
+	cached := jwtCached
+	jwtMu.Unlock()
+
+	now := time.Now().UnixMilli()
+	if cached != nil && cached.exp-now > jwtRefreshBuffer.Milliseconds() {
+		return cached.jwt, nil
 	}
-	return "", fmt.Errorf("no JWT available")
+
+	if cached != nil {
+		// Near expiry or already expired — try refresh.
+		entry, err := bootstrap(ctx)
+		if err == nil {
+			jwtMu.Lock()
+			jwtCached = entry
+			jwtMu.Unlock()
+			return entry.jwt, nil
+		}
+		// Fall back to stale token only if it's still technically valid.
+		if cached.exp > now {
+			return cached.jwt, nil
+		}
+		return "", fmt.Errorf("JWT expired and refresh failed: %w", err)
+	}
+
+	// No cached token — synchronous bootstrap.
+	entry, err := bootstrap(ctx)
+	if err != nil {
+		return "", err
+	}
+	jwtMu.Lock()
+	jwtCached = entry
+	jwtMu.Unlock()
+	return entry.jwt, nil
 }
 
 // startJwtRefresher proactively keeps the JWT fresh via a background goroutine.
@@ -310,11 +353,70 @@ func callUpstream(ctx context.Context, body []byte) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	req, err := upstreamRequest(ctx, jwt, body)
-	if err != nil {
-		return nil, err
+
+	for step := 0; step < 3; step++ {
+		req, err := upstreamRequest(ctx, jwt, body)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		// Step 0: retry if Invalid Token. Step 1: retry on any error.
+		// Step 2: return regardless.
+		doRetry := false
+		switch step {
+		case 0:
+			if resp.StatusCode < 400 || !isInvalidToken(resp) {
+				return resp, nil
+			}
+			// Invalid Token — clear bad token, re-bootstrap, retry.
+			doRetry = true
+		case 1:
+			if resp.StatusCode < 400 {
+				return resp, nil
+			}
+			// Still failing — rotate fingerprint for a fresh identity.
+			doRetry = true
+			rotateFingerprint()
+		case 2:
+			return resp, nil
+		}
+
+		if !doRetry {
+			return resp, nil
+		}
+		resp.Body.Close()
+
+		// Clear bad token before re-bootstrapping.
+		jwtMu.Lock()
+		if jwtCached != nil && jwtCached.jwt == jwt {
+			jwtCached = nil
+		}
+		jwtMu.Unlock()
+
+		entry, err := bootstrap(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("re-bootstrap after upstream error (step %d): %w", step, err)
+		}
+		jwtMu.Lock()
+		jwtCached = entry
+		jwtMu.Unlock()
+		jwt = entry.jwt
 	}
-	return httpClient.Do(req)
+	panic("unreachable")
+}
+
+// isInvalidToken drains the response body, re-wraps it for re-reading,
+// and reports whether it contains "Invalid Token".
+func isInvalidToken(resp *http.Response) bool {
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return bytes.Contains(body, []byte("Invalid Token"))
 }
 
 // --- http helpers ---
